@@ -1,0 +1,3 @@
+# Server runs on Linux: keep LF so shell scripts and Dockerfile work there.
+* text=auto eol=lf
+*.bat text eol=crlf

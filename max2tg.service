@@ -1,0 +1,15 @@
+[Unit]
+Description=MAX to Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/max2tg
+EnvironmentFile=/opt/max2tg/.env
+ExecStart=/opt/max2tg/venv/bin/python main.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
