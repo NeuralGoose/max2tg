@@ -1,5 +1,9 @@
 # MAX → Telegram 🚀
 
+<p align="center">
+  <img src="assets/hero.svg" alt="max2tg — мост между мессенджером MAX и Telegram" width="820">
+</p>
+
 > 🇬🇧 *Mirror your MAX (max.ru) messenger into Telegram — read & reply from Telegram. Two-way, media, per-chat topics. Free & self-hosted.* → [In English](#-in-english)
 
 **Читайте и отвечайте на сообщения мессенджера MAX (max.ru) прямо в Telegram.**

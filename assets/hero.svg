@@ -1,0 +1,80 @@
+<svg width="920" height="400" viewBox="0 0 920 400" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="920" y2="400" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b29"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#229ed9"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="1" y="1" width="918" height="398" rx="20" fill="url(#bg)" stroke="#2a3142" stroke-width="2"/>
+
+  <!-- header -->
+  <text x="460" y="58" text-anchor="middle" fill="#ffffff" font-size="34" font-weight="700">max2tg</text>
+  <text x="460" y="86" text-anchor="middle" fill="#8b95a7" font-size="16">читайте и отвечайте на сообщения MAX прямо в Telegram</text>
+
+  <!-- LEFT: MAX -->
+  <g transform="translate(60,120)">
+    <rect width="250" height="230" rx="16" fill="#11151f" stroke="#2a3142"/>
+    <rect width="250" height="48" rx="16" fill="#7c5cff"/>
+    <rect y="24" width="250" height="24" fill="#7c5cff"/>
+    <text x="20" y="31" fill="#ffffff" font-size="17" font-weight="700">MAX</text>
+    <text x="230" y="31" text-anchor="end" fill="#e7defe" font-size="12">max.ru</text>
+    <!-- rows -->
+    <g transform="translate(0,64)">
+      <circle cx="28" cy="22" r="16" fill="#5b8def"/><text x="28" y="27" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">И</text>
+      <text x="54" y="19" fill="#e6e9ef" font-size="14" font-weight="600">Иван</text>
+      <text x="54" y="36" fill="#7a8499" font-size="12">Привет! Ты тут?</text>
+    </g>
+    <g transform="translate(0,118)">
+      <circle cx="28" cy="22" r="16" fill="#e06c9f"/><text x="28" y="27" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">А</text>
+      <text x="54" y="19" fill="#e6e9ef" font-size="14" font-weight="600">Анна</text>
+      <text x="54" y="36" fill="#7a8499" font-size="12">📷 Фото</text>
+    </g>
+    <g transform="translate(0,172)">
+      <circle cx="28" cy="22" r="16" fill="#33b277"/><text x="28" y="27" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">П</text>
+      <text x="54" y="19" fill="#e6e9ef" font-size="14" font-weight="600">Поддержка</text>
+      <text x="54" y="36" fill="#7a8499" font-size="12">Ваша заявка принята</text>
+    </g>
+  </g>
+
+  <!-- CENTER: bridge -->
+  <g transform="translate(330,235)">
+    <line x1="0" y1="0" x2="260" y2="0" stroke="url(#accent)" stroke-width="3"/>
+    <polygon points="260,0 246,-7 246,7" fill="#229ed9"/>
+    <polygon points="0,0 14,-7 14,7" fill="#7c5cff"/>
+    <rect x="92" y="-22" width="76" height="44" rx="12" fill="#0d1117" stroke="url(#accent)" stroke-width="2"/>
+    <text x="130" y="-2" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">⇄</text>
+    <text x="130" y="15" text-anchor="middle" fill="#9aa4b6" font-size="10">bridge</text>
+  </g>
+
+  <!-- RIGHT: Telegram topics -->
+  <g transform="translate(610,120)">
+    <rect width="250" height="230" rx="16" fill="#11151f" stroke="#2a3142"/>
+    <rect width="250" height="48" rx="16" fill="#229ed9"/>
+    <rect y="24" width="250" height="24" fill="#229ed9"/>
+    <text x="20" y="31" fill="#ffffff" font-size="17" font-weight="700">Telegram</text>
+    <text x="230" y="31" text-anchor="end" fill="#d4ecfb" font-size="12">Темы</text>
+    <g transform="translate(0,64)">
+      <text x="18" y="26" fill="#5b8def" font-size="16" font-weight="700">#</text>
+      <text x="40" y="19" fill="#e6e9ef" font-size="14" font-weight="600">Иван</text>
+      <text x="40" y="36" fill="#7a8499" font-size="12">Привет! Ты тут?</text>
+    </g>
+    <g transform="translate(0,118)">
+      <text x="18" y="26" fill="#e06c9f" font-size="16" font-weight="700">#</text>
+      <text x="40" y="19" fill="#e6e9ef" font-size="14" font-weight="600">Анна</text>
+      <text x="40" y="36" fill="#7a8499" font-size="12">🖼 Фото</text>
+    </g>
+    <g transform="translate(0,172)">
+      <text x="18" y="26" fill="#33b277" font-size="16" font-weight="700">#</text>
+      <text x="40" y="19" fill="#e6e9ef" font-size="14" font-weight="600">Поддержка</text>
+      <text x="40" y="36" fill="#7a8499" font-size="12">Ваша заявка принята</text>
+    </g>
+  </g>
+
+  <!-- footer tags -->
+  <text x="460" y="388" text-anchor="middle" fill="#6b7280" font-size="12">двусторонний · медиа · темы по чатам · бесплатно · self-hosted</text>
+</svg>
