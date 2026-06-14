@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
 
-STATE_PATH = Path(__file__).parent / "state.json"
+# Where the MAX-chat -> Telegram-topic map is stored. Override with
+# MAX2TG_STATE_PATH to keep it on a persistent volume (e.g. in Docker), so
+# topics survive container restarts/rebuilds instead of being recreated.
+STATE_PATH = Path(os.environ.get("MAX2TG_STATE_PATH") or (Path(__file__).parent / "state.json"))
 
 _logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ class BridgeState:
             self._data = data
 
     def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2),

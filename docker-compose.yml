@@ -4,6 +4,14 @@ services:
     container_name: max2tg
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Persist the MAX-chat -> Telegram-topic map on the named volume below so
+      # topics are NOT recreated every time the container is rebuilt/recreated.
+      MAX2TG_STATE_PATH: /data/state.json
+    volumes:
+      - max2tg-data:/data
     # Optional: keep logs on the host
-    # volumes:
     #   - ./bridge.log:/app/bridge.log
+
+volumes:
+  max2tg-data:
