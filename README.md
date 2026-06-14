@@ -111,6 +111,10 @@ and paste your MAX token from [web.max.ru](https://web.max.ru) (DevTools console
 `state.json`). Пишете в теме — уходит в этот чат MAX; `Reply` отправляет ответ
 цитатой.
 
+> Чтобы бот **не писал** «✅ Отправлено в MAX» после каждого ответа (не засорять
+> тему), добавьте в `config.json`: `"telegram_confirm_sent": false`. Ошибки
+> отправки при этом всё равно показываются.
+
 ---
 
 ## Честные ограничения

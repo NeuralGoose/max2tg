@@ -62,6 +62,10 @@ def normalize_config(data: dict) -> dict:
         result.get("telegram_resync_titles"),
         default=False,
     )
+    result["telegram_confirm_sent"] = _coerce_bool(
+        result.get("telegram_confirm_sent"),
+        default=True,
+    )
     return result
 
 _logger = logging.getLogger(__name__)
@@ -83,6 +87,7 @@ def load_from_env() -> dict | None:
         "telegram_seed_last_messages": os.environ.get("MAX2TG_TELEGRAM_SEED_LAST_MESSAGES"),
         "telegram_preload_chat_count": os.environ.get("MAX2TG_TELEGRAM_PRELOAD_CHAT_COUNT"),
         "telegram_resync_titles": os.environ.get("MAX2TG_TELEGRAM_RESYNC_TITLES"),
+        "telegram_confirm_sent": os.environ.get("MAX2TG_TELEGRAM_CONFIRM_SENT"),
     }
     if not all(env_map.get(k) for k in REQUIRED_KEYS):
         return None

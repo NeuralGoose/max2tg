@@ -109,6 +109,9 @@ class MaxToTelegramBridge:
         # One-shot: re-resolve and rename all topic titles from MAX, even ones
         # that already have a "good-looking" name (corrects drifted/short names).
         self._resync_titles = bool(config.get("telegram_resync_titles"))
+        # Send a "✅ Отправлено в MAX" confirmation after each Telegram->MAX
+        # message. Set false to keep topics clean (errors are still shown).
+        self._confirm_sent = config.get("telegram_confirm_sent", True)
         self._own_id: int | None = None
         self._name_cache: dict[int, str] = {}
         self._client: MaxClient | None = None
@@ -571,10 +574,11 @@ class MaxToTelegramBridge:
                 f"Не удалось отправить в MAX: {exc}",
                 message_thread_id=thread_id)
             return
-        await asyncio.to_thread(
-            tg.send_message, self._token, telegram_chat_id,
-            f"✅ Отправлено в MAX → {target.get('sender', 'чат')}",
-            message_thread_id=thread_id)
+        if self._confirm_sent:
+            await asyncio.to_thread(
+                tg.send_message, self._token, telegram_chat_id,
+                f"✅ Отправлено в MAX → {target.get('sender', 'чат')}",
+                message_thread_id=thread_id)
 
     @staticmethod
     def _telegram_media_note(message: dict) -> str | None:
@@ -689,13 +693,14 @@ class MaxToTelegramBridge:
                     text=caption,
                     reply_to_message_id=target.get("message_id"),
                 )
-                await asyncio.to_thread(
-                    tg.send_message,
-                    self._token,
-                    telegram_chat_id,
-                    f"✅ Файл отправлен в MAX → {target.get('sender', 'чат')}",
-                    message_thread_id=thread_id,
-                )
+                if self._confirm_sent:
+                    await asyncio.to_thread(
+                        tg.send_message,
+                        self._token,
+                        telegram_chat_id,
+                        f"✅ Файл отправлен в MAX → {target.get('sender', 'чат')}",
+                        message_thread_id=thread_id,
+                    )
                 return
             except Exception as exc:
                 _logger.warning("Could not upload Telegram media to MAX chat %s: %s",
