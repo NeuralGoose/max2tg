@@ -71,6 +71,27 @@ def normalize_config(data: dict) -> dict:
 _logger = logging.getLogger(__name__)
 
 
+DOTENV_PATH = CONFIG_PATH.parent / ".env"
+
+
+def apply_dotenv(path: Path | None = None) -> None:
+    """Load a local .env file into os.environ so a bare `python main.py` picks
+    it up too (not only Docker/systemd). Real environment variables win."""
+    path = path or DOTENV_PATH
+    if not path.exists():
+        return
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
 def load_from_env() -> dict | None:
     """Build config from env vars (for headless/server deploys), or None.
 

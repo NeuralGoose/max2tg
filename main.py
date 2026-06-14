@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from bridge import MaxToTelegramBridge
-from config import load_config
+from config import apply_dotenv, load_config
 from setup_wizard import run_setup
 
 LOG_PATH = Path(__file__).parent / "bridge.log"
@@ -25,6 +25,7 @@ def _configure() -> None:
 
 def main() -> None:
     _configure()
+    apply_dotenv()  # load a local .env file if present (any launch method)
     config = load_config()
     if config is None:
         # No config: the setup wizard needs an interactive console + browser.

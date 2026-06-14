@@ -8,6 +8,28 @@ from config import normalize_config
 from state import BridgeState, normalize_topic_title
 
 
+class DotenvTests(unittest.TestCase):
+    def test_loads_file_but_does_not_override_real_env(self):
+        import os
+
+        import config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env"
+            path.write_text(
+                'MAX2TG_TEST_A=fromfile\n# comment\nMAX2TG_TEST_B="quoted"\n',
+                encoding="utf-8",
+            )
+            os.environ.pop("MAX2TG_TEST_A", None)
+            os.environ["MAX2TG_TEST_B"] = "realenv"
+            try:
+                config.apply_dotenv(path)
+                self.assertEqual(os.environ["MAX2TG_TEST_A"], "fromfile")
+                self.assertEqual(os.environ["MAX2TG_TEST_B"], "realenv")
+            finally:
+                os.environ.pop("MAX2TG_TEST_A", None)
+                os.environ.pop("MAX2TG_TEST_B", None)
+
+
 class ContactNameTests(unittest.TestCase):
     def test_prefers_full_name_over_first_name_only(self):
         contact = {
