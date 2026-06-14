@@ -85,6 +85,37 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config["telegram_seed_last_messages"])
         self.assertEqual(config["telegram_preload_chat_count"], 100)
 
+    def test_env_overrides_apply_over_config_json(self):
+        import os
+
+        import config as config_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                '{"telegram_bot_token": "token", "telegram_chat_id": "123",'
+                ' "max_login_token": "max"}',
+                encoding="utf-8",
+            )
+            os.environ["MAX2TG_TELEGRAM_CONFIRM_SENT"] = "false"
+            with patch.object(config_module, "CONFIG_PATH", path):
+                try:
+                    loaded = config_module.load_config()
+                finally:
+                    os.environ.pop("MAX2TG_TELEGRAM_CONFIRM_SENT", None)
+
+        # Tokens come from config.json, but the env var still wins.
+        self.assertEqual(loaded["telegram_bot_token"], "token")
+        self.assertFalse(loaded["telegram_confirm_sent"])
+
+    def test_confirm_sent_defaults_to_true(self):
+        config = normalize_config({
+            "telegram_bot_token": "token",
+            "telegram_chat_id": "123",
+            "max_login_token": "max",
+        })
+        self.assertTrue(config["telegram_confirm_sent"])
+
 
 class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
     def make_bridge(self):

@@ -92,27 +92,41 @@ def apply_dotenv(path: Path | None = None) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+# config key -> environment variable name. Used both to build a full config
+# from env vars and to let env vars override optional settings from config.json.
+ENV_MAP = {
+    "telegram_bot_token": "MAX2TG_TELEGRAM_BOT_TOKEN",
+    "telegram_chat_id": "MAX2TG_TELEGRAM_CHAT_ID",
+    "max_login_token": "MAX2TG_MAX_TOKEN",
+    "telegram_forum_chat_id": "MAX2TG_TELEGRAM_FORUM_CHAT_ID",
+    "telegram_topics_enabled": "MAX2TG_TELEGRAM_TOPICS_ENABLED",
+    "telegram_fallback_chat_id": "MAX2TG_TELEGRAM_FALLBACK_CHAT_ID",
+    "telegram_preload_topics": "MAX2TG_TELEGRAM_PRELOAD_TOPICS",
+    "telegram_seed_last_messages": "MAX2TG_TELEGRAM_SEED_LAST_MESSAGES",
+    "telegram_preload_chat_count": "MAX2TG_TELEGRAM_PRELOAD_CHAT_COUNT",
+    "telegram_resync_titles": "MAX2TG_TELEGRAM_RESYNC_TITLES",
+    "telegram_confirm_sent": "MAX2TG_TELEGRAM_CONFIRM_SENT",
+}
+
+
+def _env_overrides() -> dict:
+    """Collect set, non-empty MAX2TG_* env vars as config overrides."""
+    return {
+        key: os.environ[var]
+        for key, var in ENV_MAP.items()
+        if os.environ.get(var) not in (None, "")
+    }
+
+
 def load_from_env() -> dict | None:
     """Build config from env vars (for headless/server deploys), or None.
 
     MAX2TG_TELEGRAM_BOT_TOKEN, MAX2TG_TELEGRAM_CHAT_ID, MAX2TG_MAX_TOKEN.
     """
-    env_map = {
-        "telegram_bot_token": os.environ.get("MAX2TG_TELEGRAM_BOT_TOKEN"),
-        "telegram_chat_id": os.environ.get("MAX2TG_TELEGRAM_CHAT_ID"),
-        "max_login_token": os.environ.get("MAX2TG_MAX_TOKEN"),
-        "telegram_forum_chat_id": os.environ.get("MAX2TG_TELEGRAM_FORUM_CHAT_ID"),
-        "telegram_topics_enabled": os.environ.get("MAX2TG_TELEGRAM_TOPICS_ENABLED"),
-        "telegram_fallback_chat_id": os.environ.get("MAX2TG_TELEGRAM_FALLBACK_CHAT_ID"),
-        "telegram_preload_topics": os.environ.get("MAX2TG_TELEGRAM_PRELOAD_TOPICS"),
-        "telegram_seed_last_messages": os.environ.get("MAX2TG_TELEGRAM_SEED_LAST_MESSAGES"),
-        "telegram_preload_chat_count": os.environ.get("MAX2TG_TELEGRAM_PRELOAD_CHAT_COUNT"),
-        "telegram_resync_titles": os.environ.get("MAX2TG_TELEGRAM_RESYNC_TITLES"),
-        "telegram_confirm_sent": os.environ.get("MAX2TG_TELEGRAM_CONFIRM_SENT"),
-    }
+    env_map = _env_overrides()
     if not all(env_map.get(k) for k in REQUIRED_KEYS):
         return None
-    return normalize_config({k: v for k, v in env_map.items() if v is not None})
+    return normalize_config(env_map)
 
 
 def load_config() -> dict | None:
@@ -128,6 +142,9 @@ def load_config() -> dict | None:
         return None
     if not all(data.get(k) for k in REQUIRED_KEYS):
         return None
+    # Let MAX2TG_* env vars override optional settings (e.g. confirm_sent,
+    # topics) even when the tokens themselves come from config.json.
+    data.update(_env_overrides())
     return normalize_config(data)
 
 
