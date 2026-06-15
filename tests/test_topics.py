@@ -30,6 +30,21 @@ class DotenvTests(unittest.TestCase):
                 os.environ.pop("MAX2TG_TEST_B", None)
 
 
+class StateSaveTests(unittest.TestCase):
+    def test_falls_back_when_atomic_replace_fails(self):
+        import json
+
+        # A single-file bind mount in Docker makes tmp.replace() raise
+        # EBUSY/EXDEV; save() must still persist via a direct write.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            state = BridgeState(path)
+            with patch("pathlib.Path.replace", side_effect=OSError("EBUSY")):
+                state.save_topic(123, thread_id=7, title="X", chat_type="dialog")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["topics"]["123"]["telegram_thread_id"], 7)
+
+
 class ContactNameTests(unittest.TestCase):
     def test_prefers_full_name_over_first_name_only(self):
         contact = {

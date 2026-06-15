@@ -36,13 +36,29 @@ class BridgeState:
             self._data = data
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(self.path)
+        payload = json.dumps(self._data, ensure_ascii=False, indent=2)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(self.path)
+            return
+        except OSError as exc:
+            # Atomic rename fails when state.json is a single bind-mounted file
+            # in Docker (renaming over a mount point raises EBUSY/EXDEV). Fall
+            # back to a direct in-place write so single-file mounts still persist.
+            _logger.warning("Atomic state save failed (%s); writing in place.", exc)
+        try:
+            self.path.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            _logger.error("Could not persist state: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
     def get_topic(self, max_chat_id: int | str) -> dict[str, Any] | None:
         topic = self._data["topics"].get(str(max_chat_id))
