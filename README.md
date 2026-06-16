@@ -32,6 +32,15 @@
 > тоже можно прямо из Telegram. По факту это **единственный рабочий способ**
 > читать и писать в MAX с iPhone.
 
+<p align="center">
+  <img src="assets/shot-notification.svg" width="265" alt="Пуш-уведомление MAX в Telegram на экране iPhone">
+  &nbsp;&nbsp;
+  <img src="assets/shot-topics.svg" width="265" alt="Каждый чат MAX — отдельная тема в Telegram">
+</p>
+<p align="center">
+  <sub>Пуш из MAX прямо на локскрине iPhone&nbsp;·&nbsp;каждый чат MAX — отдельная тема в Telegram&nbsp;&nbsp;<i>(макеты интерфейса)</i></sub>
+</p>
+
 ## Содержание
 
 - [Возможности](#возможности)
