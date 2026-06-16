@@ -31,6 +31,26 @@ class DotenvTests(unittest.TestCase):
                 os.environ.pop("MAX2TG_TEST_A", None)
                 os.environ.pop("MAX2TG_TEST_B", None)
 
+    def test_handles_export_prefix_and_inline_comment(self):
+        import os
+
+        import config
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env"
+            path.write_text(
+                'export MAX2TG_TA=hello\nMAX2TG_TB=100  # a default\n'
+                'MAX2TG_TC="q v"\n', encoding="utf-8")
+            for k in ("MAX2TG_TA", "MAX2TG_TB", "MAX2TG_TC"):
+                os.environ.pop(k, None)
+            try:
+                config.apply_dotenv(path)
+                self.assertEqual(os.environ["MAX2TG_TA"], "hello")
+                self.assertEqual(os.environ["MAX2TG_TB"], "100")
+                self.assertEqual(os.environ["MAX2TG_TC"], "q v")
+            finally:
+                for k in ("MAX2TG_TA", "MAX2TG_TB", "MAX2TG_TC"):
+                    os.environ.pop(k, None)
+
 
 class StateSaveTests(unittest.TestCase):
     def test_falls_back_when_atomic_replace_fails(self):
@@ -173,6 +193,15 @@ class ConfigTests(unittest.TestCase):
         })
         self.assertTrue(config["telegram_confirm_sent"])
 
+    def test_corrupt_config_is_logged(self):
+        import config as config_module
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text("{ not json", encoding="utf-8")
+            with patch.object(config_module, "CONFIG_PATH", path):
+                with self.assertLogs("config", level="WARNING"):
+                    self.assertEqual(config_module.load_partial(), {})
+
 
 class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
     def make_bridge(self):
@@ -223,6 +252,22 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(len(created), 1)  # exactly one topic created
             self.assertEqual(results[0][1], results[1][1])  # same thread id
+
+    async def test_name_cache_is_bounded(self):
+        bridge = self.make_bridge()
+        with patch("bridge.NAME_CACHE_LIMIT", 3), \
+                patch("bridge.resolve_users", new=AsyncMock(return_value={})):
+            for i in range(6):
+                await bridge._resolve_sender_name(object(), 1000 + i)
+        self.assertLessEqual(len(bridge._name_cache), 3)
+
+    async def test_on_packet_ignores_non_dict_frame(self):
+        bridge = self.make_bridge()
+        client = object()
+        bridge._client = client
+        # A valid-JSON but non-dict frame must be ignored cleanly, not raise
+        # AttributeError out of the fire-and-forget handler task.
+        await bridge._on_packet(client, [1, 2, 3])  # must not raise
 
     async def test_falls_back_when_topic_creation_fails(self):
         bridge = self.make_bridge()
@@ -432,6 +477,40 @@ class MaxClientPendingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConnectionError):
             fut.result()
         self.assertEqual(client._pending, {})
+
+    async def test_recv_loop_skips_bad_frames(self):
+        import max_client
+
+        class FakeConn:
+            def __init__(self, frames):
+                self._frames = frames
+
+            def __aiter__(self):
+                return self._agen()
+
+            async def _agen(self):
+                for frame in self._frames:
+                    yield frame
+
+        client = max_client.BrowserMaxClient()
+        dispatched = []
+
+        async def callback(_c, packet):
+            dispatched.append(packet)
+
+        client._incoming_event_callback = callback
+        client._connection = FakeConn([
+            "not json at all",                       # unparseable -> skipped
+            "[1, 2, 3]",                             # valid JSON, non-dict -> skipped
+            "42",                                    # valid JSON scalar -> skipped
+            '{"opcode": 128, "payload": {"x": 1}}',  # valid event (no seq)
+        ])
+        await client._recv_loop()
+        await asyncio.sleep(0.01)  # let the dispatched task run
+        # Only the dict event is dispatched; non-dict frames never reach a
+        # callback that assumes a dict (would otherwise AttributeError).
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["opcode"], 128)
 
 
 if __name__ == "__main__":

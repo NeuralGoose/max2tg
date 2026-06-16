@@ -57,6 +57,41 @@ class BrowserMaxClient(MaxClient):
         _logger.info("Connected. Receive task started.")
         return self._connection
 
+    async def _recv_loop(self):
+        # Defensive override: the reverse-engineered MAX server can push a
+        # non-JSON or seq-less frame; vkmax's loop subscripts packet["seq"] and
+        # json.loads() unguarded, so one bad frame would kill the whole receive
+        # pipeline (and, since wait_closed() wouldn't return, block reconnect).
+        try:
+            async for raw in self._connection:
+                try:
+                    packet = json.loads(raw)
+                except (ValueError, TypeError):
+                    _logger.warning("Skipping unparseable MAX frame")
+                    continue
+                if not isinstance(packet, dict):
+                    # Valid JSON but not an object (array/scalar): it can be
+                    # neither a request reply nor an incoming event, so don't
+                    # dispatch it to a callback that assumes a dict.
+                    _logger.warning("Skipping non-object MAX frame (%s)",
+                                    type(packet).__name__)
+                    continue
+                try:
+                    seq = packet.get("seq")
+                    future = self._pending.pop(seq, None)
+                    if future is not None:
+                        if not future.done():
+                            future.set_result(packet)
+                    elif self._incoming_event_callback:
+                        asyncio.create_task(
+                            self._incoming_event_callback(self, packet))
+                except Exception:
+                    _logger.exception("Error handling MAX frame")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            _logger.warning("MAX receive loop ended: %s", exc)
+
     async def _send_hello_packet(self):
         return await self.invoke_method(
             opcode=6,

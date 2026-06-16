@@ -25,7 +25,12 @@ _logger = logging.getLogger(__name__)
 
 INCOMING_MESSAGE_OPCODE = 128
 RECONNECT_DELAY_SECONDS = 15
+RECONNECT_MAX_DELAY = 300
 REPLY_MAP_LIMIT = 10000
+NAME_CACHE_LIMIT = 5000
+# Cap concurrent per-packet handlers so a media burst can't exhaust the asyncio
+# to_thread pool and starve the Telegram long-poll.
+MEDIA_CONCURRENCY = 8
 # Telegram bots can upload at most 50 MB; leave headroom.
 TELEGRAM_UPLOAD_LIMIT = 49 * 1024 * 1024
 ATTACH_DEBUG_LOG = Path(__file__).parent / "attaches.log"
@@ -113,7 +118,8 @@ class MaxToTelegramBridge:
         # message. Set false to keep topics clean (errors are still shown).
         self._confirm_sent = config.get("telegram_confirm_sent", True)
         self._own_id: int | None = None
-        self._name_cache: dict[int, str] = {}
+        # Bounded LRU so a long-running process can't grow the cache forever.
+        self._name_cache: "OrderedDict[int, str]" = OrderedDict()
         self._client: MaxClient | None = None
         self._state = BridgeState()
         # telegram message_id -> {"chat_id", "message_id", "sender"}
@@ -124,6 +130,8 @@ class MaxToTelegramBridge:
         # Strong refs to in-flight per-packet handler tasks: vkmax spawns them
         # fire-and-forget, and without a reference they can be GC'd mid-run.
         self._handler_tasks: set = set()
+        # Lazily created (needs a running loop): bounds concurrent forwards.
+        self._forward_sem: "asyncio.Semaphore | None" = None
 
     # --- helpers -------------------------------------------------------------
 
@@ -144,6 +152,7 @@ class MaxToTelegramBridge:
 
     async def _resolve_sender_name(self, client: MaxClient, sender_id: int) -> str:
         if sender_id in self._name_cache:
+            self._name_cache.move_to_end(sender_id)  # keep hot senders
             return self._name_cache[sender_id]
         name = str(sender_id)
         try:
@@ -156,6 +165,8 @@ class MaxToTelegramBridge:
         except Exception as exc:
             _logger.warning("Could not resolve user %s: %s", sender_id, exc)
         self._name_cache[sender_id] = name
+        while len(self._name_cache) > NAME_CACHE_LIMIT:
+            self._name_cache.popitem(last=False)
         return name
 
     def _extract_chat_meta(self, payload: dict, sender: str) -> tuple[str, str]:
@@ -460,34 +471,47 @@ class MaxToTelegramBridge:
         if task is not None:
             self._handler_tasks.add(task)
             task.add_done_callback(self._handler_tasks.discard)
-        try:
-            if packet.get("opcode") != INCOMING_MESSAGE_OPCODE:
-                return
-            payload = packet.get("payload", {})
-            message = payload.get("message", {})
-            sender_id = message.get("sender")
-            if sender_id is not None and sender_id == self._own_id:
-                return  # our own outgoing message echoed back
+        # Drop packets from a torn-down session (the active client was replaced),
+        # so a stale handler can't act against a dead/new connection.
+        if client is not self._client:
+            return
+        # Guard before any .get(): a non-dict frame would raise AttributeError
+        # in this fire-and-forget task (an unretrieved-exception log), not the
+        # clean handling below. _recv_loop already filters these, but this keeps
+        # the handler robust to any caller.
+        if not isinstance(packet, dict):
+            return
+        if packet.get("opcode") != INCOMING_MESSAGE_OPCODE:
+            return
+        if self._forward_sem is None:
+            self._forward_sem = asyncio.Semaphore(MEDIA_CONCURRENCY)
+        async with self._forward_sem:
+            try:
+                payload = packet.get("payload", {})
+                message = payload.get("message", {})
+                sender_id = message.get("sender")
+                if sender_id is not None and sender_id == self._own_id:
+                    return  # our own outgoing message echoed back
 
-            chat_id = payload.get("chatId")
-            max_message_id = message.get("id")
-            text = (message.get("text") or "").strip()
-            parsed = attaches.parse(message)
-            if message.get("attaches"):
-                _log_raw_attaches(message)
+                chat_id = payload.get("chatId")
+                max_message_id = message.get("id")
+                text = (message.get("text") or "").strip()
+                parsed = attaches.parse(message)
+                if message.get("attaches"):
+                    _log_raw_attaches(message)
 
-            sender = (await self._resolve_sender_name(client, sender_id)
-                      if isinstance(sender_id, int) else "неизвестный отправитель")
-            chat_title, chat_type = self._extract_chat_meta(payload, sender)
-            header = f"MAX | {sender} (чат {chat_id})"
+                sender = (await self._resolve_sender_name(client, sender_id)
+                          if isinstance(sender_id, int) else "неизвестный отправитель")
+                chat_title, chat_type = self._extract_chat_meta(payload, sender)
+                header = f"MAX | {sender} (чат {chat_id})"
 
-            await self._forward(client, header, text, parsed,
-                                chat_id, max_message_id, sender,
-                                chat_title, chat_type)
-            _logger.info("Forwarded from %s (chat %s, %d attach)",
-                         sender, chat_id, len(parsed))
-        except Exception:
-            _logger.exception("Failed to handle packet: %s", packet)
+                await self._forward(client, header, text, parsed,
+                                    chat_id, max_message_id, sender,
+                                    chat_title, chat_type)
+                _logger.info("Forwarded from %s (chat %s, %d attach)",
+                             sender, chat_id, len(parsed))
+            except Exception:
+                _logger.exception("Failed to handle packet: %s", packet)
 
     async def _forward(self, client, header, text, parsed,
                        chat_id, max_message_id, sender, chat_title, chat_type):
@@ -524,6 +548,18 @@ class MaxToTelegramBridge:
     def _caption(header, header_sent, item_text):
         return item_text if header_sent else f"{header}\n{item_text}"
 
+    async def _send_note(self, telegram_chat_id, text, thread_id):
+        """Send a plain-text note; on failure log at error and return None so a
+        broken Telegram destination is visible instead of silently dropped."""
+        try:
+            return await asyncio.to_thread(
+                tg.send_message, self._token, telegram_chat_id, text,
+                message_thread_id=thread_id)
+        except Exception as exc:
+            _logger.error("Could not deliver note to Telegram chat %s: %s",
+                          telegram_chat_id, exc)
+            return None
+
     async def _send_media_item(self, item, header_sent, ctx) -> bool:
         _client, header, chat_id, max_message_id, sender, telegram_chat_id, thread_id, in_topic = ctx
         caption = (item.text if header_sent else f"{sender}:\n{item.text}"
@@ -540,10 +576,9 @@ class MaxToTelegramBridge:
                     message_thread_id=thread_id)
         except Exception as exc:
             _logger.warning("Failed to send %s: %s", item.kind, exc)
-            msg_id = await asyncio.to_thread(
-                tg.send_message, self._token, telegram_chat_id,
-                f"{caption} [не удалось переслать медиа]",
-                message_thread_id=thread_id)
+            msg_id = await self._send_note(
+                telegram_chat_id, f"{caption} [не удалось переслать медиа]",
+                thread_id)
         self._remember(msg_id, chat_id, max_message_id, sender,
                        telegram_chat_id, thread_id)
         return True
@@ -576,9 +611,8 @@ class MaxToTelegramBridge:
                     message_thread_id=thread_id)
         except Exception as exc:
             _logger.warning("Failed to resolve/send %s: %s", item.kind, exc)
-            msg_id = await asyncio.to_thread(
-                tg.send_message, self._token, telegram_chat_id,
-                f"{caption} — открыть в MAX", message_thread_id=thread_id)
+            msg_id = await self._send_note(
+                telegram_chat_id, f"{caption} — открыть в MAX", thread_id)
         self._remember(msg_id, chat_id, max_message_id, sender,
                        telegram_chat_id, thread_id)
         return True
@@ -770,7 +804,11 @@ class MaxToTelegramBridge:
         if str(incoming_chat) not in allowed_chats:
             return
         text = self._telegram_outgoing_text(message)
-        if not text or text.startswith("/"):
+        if text.startswith("/"):
+            return
+        # Act on real content, not on the display note: an attachment with no
+        # caption (and no media-note label) must still be routed to MAX.
+        if not text and not self._telegram_attachment(message):
             return
         reply = message.get("reply_to_message")
         target = self._reply_map.get(reply.get("message_id")) if reply else None
@@ -802,15 +840,26 @@ class MaxToTelegramBridge:
                 offset = backlog[-1]["update_id"] + 1
         except Exception as exc:
             _logger.warning("Telegram backlog drain failed: %s", exc)
+        fail_delay = 5
         while True:
             try:
                 updates = await asyncio.to_thread(tg.get_updates, self._token, offset, 25)
+                fail_delay = 5
             except Exception as exc:
-                _logger.warning("Telegram poll error: %s", exc)
-                await asyncio.sleep(5)
+                if "409" in str(exc) or "Conflict" in str(exc):
+                    _logger.error("Telegram getUpdates 409 Conflict — another "
+                                  "instance is polling this bot. Retry in %ss.",
+                                  fail_delay)
+                else:
+                    _logger.warning("Telegram poll error: %s", exc)
+                await asyncio.sleep(fail_delay)
+                fail_delay = min(fail_delay * 2, 60)
                 continue
             for update in updates:
-                offset = update["update_id"] + 1
+                uid = update.get("update_id")
+                if uid is None:
+                    continue  # advance past anything malformed
+                offset = uid + 1
                 try:
                     await self._handle_update(update)
                 except Exception:
@@ -850,7 +899,10 @@ class MaxToTelegramBridge:
                 pass
 
     async def _max_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        failures = 0
         while True:
+            started = loop.time()
             try:
                 await self._run_session()
             except MaxAuthError as exc:
@@ -859,8 +911,20 @@ class MaxToTelegramBridge:
                       "пройдите настройку заново.")
             except Exception as exc:
                 _logger.error("Session error: %s", exc)
-            _logger.info("Reconnecting in %s seconds...", RECONNECT_DELAY_SECONDS)
-            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+            # A session that stayed up a while resets the backoff; rapid repeated
+            # drops (e.g. a revoked token) escalate the delay and warn the user.
+            if loop.time() - started > 120:
+                failures = 0
+            failures += 1
+            delay = min(RECONNECT_DELAY_SECONDS * (2 ** (failures - 1)),
+                        RECONNECT_MAX_DELAY)
+            if failures == 5:
+                _logger.error("MAX keeps disconnecting %d times in a row — the "
+                              "token is likely revoked.", failures)
+                print("⚠️ MAX постоянно отключается — возможно, токен отозван. "
+                      "Возьмите свежий токен (web.max.ru) и перезапустите.")
+            _logger.info("Reconnecting in %s seconds...", delay)
+            await asyncio.sleep(delay)
 
     async def run_forever(self) -> None:
         await asyncio.gather(self._max_loop(), self._poll_telegram())

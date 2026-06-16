@@ -88,8 +88,21 @@ def apply_dotenv(path: Path | None = None) -> None:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[len("export "):]
         key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key, value = key.strip(), value.strip()
+        if value[:1] in ("'", '"'):
+            quote = value[0]
+            end = value.find(quote, 1)
+            value = value[1:end] if end != -1 else value[1:]
+        else:
+            # Drop an inline comment ("  # ...") from an UNQUOTED value; the
+            # space guard avoids mangling tokens that legitimately contain '#'.
+            hash_at = value.find(" #")
+            if hash_at != -1:
+                value = value[:hash_at].rstrip()
+        os.environ.setdefault(key, value)
 
 
 # config key -> environment variable name. Used both to build a full config
@@ -151,7 +164,10 @@ def load_partial() -> dict:
         return {}
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        # Distinguish a corrupt/unreadable config.json from a genuinely absent
+        # one (which returns {} above) so headless deploys are diagnosable.
+        _logger.warning("Could not read config.json: %s", exc)
         return {}
 
 
@@ -164,9 +180,12 @@ def _restrict_permissions() -> None:
         except OSError as exc:
             _logger.warning("Could not chmod config.json: %s", exc)
         return
-    username = os.environ.get("USERNAME")
+    username = os.environ.get("USERNAME") or ""
     if not username:
-        return
+        try:
+            username = os.getlogin()
+        except OSError:
+            return
     try:
         subprocess.run(
             ["icacls", str(CONFIG_PATH), "/inheritance:r",
@@ -178,6 +197,13 @@ def _restrict_permissions() -> None:
 
 
 def save_config(config: dict) -> None:
+    if os.name != "nt" and not CONFIG_PATH.exists():
+        # Create the token file already-restricted (0o600) so it is never even
+        # briefly world-readable between write and chmod (TOCTOU).
+        try:
+            os.close(os.open(CONFIG_PATH, os.O_CREAT | os.O_WRONLY, 0o600))
+        except OSError:
+            pass
     CONFIG_PATH.write_text(
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
     )
