@@ -40,7 +40,10 @@
   <img src="assets/shot-reply.svg" width="232" alt="Ответ из Telegram уходит обратно в MAX">
 </p>
 <p align="center">
-  <sub>Пуши из MAX на локскрине iPhone&nbsp;·&nbsp;каждый чат — отдельная тема&nbsp;·&nbsp;ответ из Telegram уходит обратно в MAX&nbsp;&nbsp;<i>(макеты интерфейса)</i></sub>
+  <sub><b>1.</b> пуши из MAX на локскрине iPhone&nbsp;·&nbsp;<b>2.</b> каждый чат — отдельная тема&nbsp;·&nbsp;<b>3.</b> ответ из Telegram уходит обратно в MAX&nbsp;&nbsp;<i>(макеты)</i></sub>
+</p>
+<p align="center">
+  <sub>Видно, что сообщения именно из MAX: мост помечает каждое — <code>MAX | Имя (чат …)</code>, голосовые как <code>🎤 Голосовое (N с) — открыть в MAX</code>, а доставку ответа подтверждает <code>✅ Отправлено в MAX</code>. Это реальный формат вывода моста.</sub>
 </p>
 
 ## Содержание
