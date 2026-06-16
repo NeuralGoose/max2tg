@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 820" width="400" height="820" font-family="-apple-system, 'SF Pro Display', 'Segoe UI', Roboto, Arial, sans-serif">
+  <defs>
+    <clipPath id="screen3"><rect x="22" y="22" width="356" height="776" rx="46"/></clipPath>
+  </defs>
+
+  <rect x="10" y="10" width="380" height="800" rx="58" fill="#0b0b0e"/>
+  <rect x="13" y="13" width="374" height="794" rx="55" fill="#000"/>
+
+  <g clip-path="url(#screen3)">
+    <rect x="22" y="22" width="356" height="776" fill="#0e1621"/>
+
+    <!-- header -->
+    <rect x="22" y="22" width="356" height="108" fill="#1d2a39"/>
+    <line x1="22" y1="130" x2="378" y2="130" stroke="#0c141d" stroke-width="1"/>
+    <text x="50" y="55" fill="#fff" font-size="15" font-weight="600">9:41</text>
+    <g fill="#fff">
+      <rect x="300" y="47" width="3" height="7" rx="1"/><rect x="305" y="44" width="3" height="10" rx="1"/>
+      <rect x="310" y="41" width="3" height="13" rx="1"/><rect x="315" y="38" width="3" height="16" rx="1"/>
+      <path d="M326 47a8 8 0 0 1 16 0z"/>
+      <rect x="346" y="41" width="20" height="11" rx="3.2" fill="none" stroke="#fff" stroke-width="1.4"/>
+      <rect x="348" y="43" width="14" height="7" rx="1.5"/><rect x="367" y="44" width="1.6" height="5" rx="0.8"/>
+    </g>
+    <rect x="158" y="33" width="84" height="27" rx="13.5" fill="#000"/>
+    <!-- back, avatar, title -->
+    <path d="M50 102l-9-9 9-9" fill="none" stroke="#5eb5f7" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="84" cy="98" r="18" fill="#ff7a8a"/><text x="84" y="104" text-anchor="middle" fill="#fff" font-size="16" font-weight="600">А</text>
+    <text x="110" y="93" fill="#ffffff" font-size="16" font-weight="700">Алина Чернова</text>
+    <text x="110" y="112" fill="#7c8b9a" font-size="12">тема MAX · ответ из Telegram уходит в MAX</text>
+
+    <!-- date pill -->
+    <rect x="168" y="146" width="64" height="22" rx="11" fill="#1a2735"/>
+    <text x="200" y="161" text-anchor="middle" fill="#8fa0b2" font-size="12">Сегодня</text>
+
+    <!-- incoming bubble 1 -->
+    <rect x="40" y="182" width="258" height="52" rx="16" fill="#182533"/>
+    <text x="56" y="207" fill="#e7eef5" font-size="14.5">Привет! Освободилась — ты где?</text>
+    <text x="286" y="225" text-anchor="end" fill="#5d6b78" font-size="11">9:41</text>
+
+    <!-- incoming bubble 2 -->
+    <rect x="40" y="244" width="176" height="46" rx="16" fill="#182533"/>
+    <text x="56" y="269" fill="#e7eef5" font-size="14.5">Поехали в кафе? ☕️</text>
+    <text x="204" y="283" text-anchor="end" fill="#5d6b78" font-size="11">9:41</text>
+
+    <!-- outgoing bubble (reply) -->
+    <rect x="150" y="304" width="210" height="98" rx="16" fill="#2b5278"/>
+    <rect x="166" y="318" width="3" height="46" rx="1.5" fill="#5eb5f7"/>
+    <text x="178" y="332" fill="#9fd3ff" font-size="12.5" font-weight="600">Алина Чернова</text>
+    <text x="178" y="352" fill="#c9dcee" font-size="12.5">Поехали в кафе? ☕️</text>
+    <text x="166" y="384" fill="#ffffff" font-size="14.5">Да! Буду через 20 минут 👍</text>
+    <text x="332" y="392" text-anchor="end" fill="#b9d6f0" font-size="11">9:42</text>
+    <path d="M340 386l3 3 6-7M346 386l3 3" fill="none" stroke="#6cc5ff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- round-trip note -->
+    <text x="200" y="428" text-anchor="middle" fill="#5d6b78" font-size="11.5">↪ доставлено в MAX</text>
+
+    <!-- input bar -->
+    <rect x="22" y="700" width="356" height="98" fill="#17212b"/>
+    <line x1="22" y1="700" x2="378" y2="700" stroke="#0c141d" stroke-width="1"/>
+    <g transform="translate(44,740)" stroke="#7c8b9a" stroke-width="2" fill="none" stroke-linecap="round">
+      <path d="M3 7l9-9a4 4 0 0 1 6 6l-10 10a2.5 2.5 0 0 1-4-4l9-9"/>
+    </g>
+    <rect x="76" y="731" width="250" height="36" rx="18" fill="#242f3d"/>
+    <text x="92" y="754" fill="#6c7883" font-size="14.5">Сообщение</text>
+    <circle cx="352" cy="749" r="17" fill="#3390ec"/>
+    <g transform="translate(341,738) scale(0.92)" fill="#fff">
+      <path d="M21.9 4.8c.27-1.2-.43-1.66-1.2-1.37L2.5 10.3c-1.23.47-1.2 1.16-.2 1.47l4.65 1.45 10.8-6.8c.5-.33.96-.15.58.18l-8.74 7.9-.34 4.83c.48 0 .69-.2.94-.45l2.26-2.17 4.7 3.46c.86.48 1.48.23 1.7-.8l3.07-14.5z"/>
+    </g>
+
+    <rect x="148" y="782" width="104" height="5" rx="2.5" fill="#fff" opacity="0.5"/>
+  </g>
+</svg>

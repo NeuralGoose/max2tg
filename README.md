@@ -33,12 +33,14 @@
 > читать и писать в MAX с iPhone.
 
 <p align="center">
-  <img src="assets/shot-notification.svg" width="265" alt="Пуш-уведомление MAX в Telegram на экране iPhone">
-  &nbsp;&nbsp;
-  <img src="assets/shot-topics.svg" width="265" alt="Каждый чат MAX — отдельная тема в Telegram">
+  <img src="assets/shot-notification.svg" width="232" alt="Пуш-уведомление MAX в Telegram на экране iPhone">
+  &nbsp;
+  <img src="assets/shot-topics.svg" width="232" alt="Каждый чат MAX — отдельная тема в Telegram">
+  &nbsp;
+  <img src="assets/shot-reply.svg" width="232" alt="Ответ из Telegram уходит обратно в MAX">
 </p>
 <p align="center">
-  <sub>Пуш из MAX прямо на локскрине iPhone&nbsp;·&nbsp;каждый чат MAX — отдельная тема в Telegram&nbsp;&nbsp;<i>(макеты интерфейса)</i></sub>
+  <sub>Пуши из MAX на локскрине iPhone&nbsp;·&nbsp;каждый чат — отдельная тема&nbsp;·&nbsp;ответ из Telegram уходит обратно в MAX&nbsp;&nbsp;<i>(макеты интерфейса)</i></sub>
 </p>
 
 ## Содержание
