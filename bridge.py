@@ -563,6 +563,8 @@ class MaxToTelegramBridge:
         telegram_chat_id, thread_id, in_topic = await self._telegram_target(
             chat_id, chat_title, chat_type, sender
         )
+        if in_topic:
+            await self._ensure_control(chat_id, thread_id)
         topic = self._state.get_topic(chat_id) if in_topic else None
         is_channel = (chat_type == "channel"
                       or bool(topic and topic.get("chat_type") == "channel"))
@@ -601,6 +603,80 @@ class MaxToTelegramBridge:
         if muted is not None:
             return bool(muted)
         return bool(is_channel and self._silent_channels)
+
+    @staticmethod
+    def _mute_markup(chat_id, silent: bool) -> dict:
+        """Inline keyboard with one mute-toggle button (label shows the action)."""
+        label = "🔔 Включить звук" if silent else "🔕 Выключить звук"
+        return {"inline_keyboard": [[
+            {"text": label, "callback_data": f"mute:{chat_id}"}]]}
+
+    async def _ensure_control(self, chat_id, thread_id) -> None:
+        """Post (once per topic) a pinned message with a mute-toggle button — like
+        a channel's "Вкл./Выкл. звук". Lazy: created on the topic's first forward."""
+        topic = self._state.get_topic(chat_id)
+        if not topic or topic.get("control_msg_id") or not self._forum_chat_id:
+            return
+        silent = self._is_silent(chat_id, topic.get("chat_type") == "channel")
+        try:
+            msg_id = await asyncio.to_thread(
+                tg.send_message, self._token, self._forum_chat_id,
+                "🔔 Уведомления этого чата:", message_thread_id=thread_id,
+                disable_notification=True,
+                reply_markup=self._mute_markup(chat_id, silent))
+        except Exception as exc:
+            _logger.warning("control button post failed for %s: %s", chat_id, exc)
+            return
+        if not msg_id:
+            return
+        self._state.set_control_message(chat_id, msg_id)
+        try:
+            await asyncio.to_thread(
+                tg.pin_chat_message, self._token, self._forum_chat_id, msg_id)
+        except Exception as exc:
+            _logger.info("pin control failed for %s: %s", chat_id, exc)
+
+    async def _handle_callback(self, cb: dict) -> None:
+        """Handle an inline mute-button tap (callback_query)."""
+        cb_id = cb.get("id")
+        data = cb.get("data") or ""
+        msg = cb.get("message") or {}
+        chat = msg.get("chat", {}).get("id")
+        allowed = {str(self._chat_id), str(self._fallback_chat_id)}
+        if self._forum_chat_id:
+            allowed.add(str(self._forum_chat_id))
+
+        async def ack(text=None):
+            if cb_id:
+                try:
+                    await asyncio.to_thread(
+                        tg.answer_callback_query, self._token, cb_id, text)
+                except Exception:
+                    pass
+
+        if str(chat) not in allowed or not data.startswith("mute:"):
+            await ack()
+            return
+        try:
+            max_chat_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await ack()
+            return
+        topic = self._state.get_topic(max_chat_id)
+        if not topic:
+            await ack("Чат не найден")
+            return
+        is_channel = topic.get("chat_type") == "channel"
+        new_muted = not self._is_silent(max_chat_id, is_channel)
+        self._state.set_muted(max_chat_id, new_muted)
+        try:
+            await asyncio.to_thread(
+                tg.edit_message_text, self._token, chat, msg.get("message_id"),
+                "🔔 Уведомления этого чата:",
+                reply_markup=self._mute_markup(max_chat_id, new_muted))
+        except Exception as exc:
+            _logger.info("edit control failed: %s", exc)
+        await ack("🔕 Без звука" if new_muted else "🔔 Со звуком")
 
     async def _send_note(self, telegram_chat_id, text, thread_id,
                          disable_notification: bool = False):
@@ -993,7 +1069,10 @@ class MaxToTelegramBridge:
                     continue  # advance past anything malformed
                 offset = uid + 1
                 try:
-                    await self._handle_update(update)
+                    if "callback_query" in update:
+                        await self._handle_callback(update["callback_query"])
+                    else:
+                        await self._handle_update(update)
                 except Exception:
                     _logger.exception("Failed to handle Telegram update")
 

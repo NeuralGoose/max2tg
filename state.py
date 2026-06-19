@@ -125,6 +125,15 @@ class BridgeState:
         self.save()
         return bool(muted)
 
+    def set_control_message(self, max_chat_id: int | str, message_id: int) -> None:
+        """Remember the per-topic mute-toggle control message so it isn't re-posted."""
+        topic = self.get_topic(max_chat_id)
+        if not topic:
+            return
+        topic["control_msg_id"] = message_id
+        self._data["topics"][str(max_chat_id)] = topic
+        self.save()
+
 
 def normalize_topic_title(value: str, fallback: str) -> str:
     title = " ".join((value or "").split()) or fallback

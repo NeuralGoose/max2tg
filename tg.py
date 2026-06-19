@@ -116,7 +116,7 @@ def set_my_commands(token: str, commands: list[dict]) -> None:
 
 
 def get_updates(token: str, offset: int | None = None, timeout: int = 25) -> list[dict]:
-    params = {"timeout": timeout, "allowed_updates": ["message"]}
+    params = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
     if offset is not None:
         params["offset"] = offset
     return _call(token, "getUpdates", **params)
@@ -166,15 +166,17 @@ def edit_forum_topic(token: str, chat_id: int | str, message_thread_id: int,
 def send_message(token: str, chat_id: int | str, text: str,
                  reply_to_message_id: int | None = None,
                  message_thread_id: int | None = None,
-                 disable_notification: bool = False) -> int | None:
+                 disable_notification: bool = False,
+                 reply_markup: dict | None = None) -> int | None:
     """Send plain text, splitting over Telegram's length limit.
 
     disable_notification=True delivers silently (no sound/alert) regardless of
-    the recipient's mute settings. Returns the first chunk's message_id.
+    the recipient's mute settings. reply_markup attaches an inline keyboard (to
+    the last chunk). Returns the first chunk's message_id.
     """
     first_id: int | None = None
-    for start in range(0, len(text), MAX_MESSAGE_LEN):
-        chunk = text[start:start + MAX_MESSAGE_LEN]
+    chunks = [text[i:i + MAX_MESSAGE_LEN] for i in range(0, len(text), MAX_MESSAGE_LEN)] or [""]
+    for idx, chunk in enumerate(chunks):
         params = {"chat_id": chat_id, "text": chunk,
                   "disable_web_page_preview": True}
         if disable_notification:
@@ -183,10 +185,36 @@ def send_message(token: str, chat_id: int | str, text: str,
             params["message_thread_id"] = message_thread_id
         if reply_to_message_id and first_id is None:
             params["reply_to_message_id"] = reply_to_message_id
+        if reply_markup and idx == len(chunks) - 1:
+            params["reply_markup"] = reply_markup
         result = _call(token, "sendMessage", **params)
         if first_id is None:
             first_id = result.get("message_id")
     return first_id
+
+
+def edit_message_text(token: str, chat_id: int | str, message_id: int, text: str,
+                      reply_markup: dict | None = None) -> None:
+    """Edit a message's text (and optionally its inline keyboard)."""
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup is not None:
+        params["reply_markup"] = reply_markup
+    _call(token, "editMessageText", **params)
+
+
+def answer_callback_query(token: str, callback_query_id: str,
+                          text: str | None = None) -> None:
+    """Acknowledge an inline-button tap (stops the client's loading spinner)."""
+    params = {"callback_query_id": callback_query_id}
+    if text:
+        params["text"] = text
+    _call(token, "answerCallbackQuery", **params)
+
+
+def pin_chat_message(token: str, chat_id: int | str, message_id: int) -> None:
+    """Pin a message (silently). Best-effort: ignores 'nothing changed' errors."""
+    _call(token, "pinChatMessage", chat_id=chat_id, message_id=message_id,
+          disable_notification=True)
 
 
 def _send_media(token: str, method: str, field: str, chat_id: int | str,

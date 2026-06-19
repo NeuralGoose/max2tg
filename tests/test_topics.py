@@ -365,7 +365,8 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
             def fake_send(token, chat_id, body, **kw):
                 captured["silent"] = kw.get("disable_notification")
                 return 1
-            with patch("bridge.tg.send_message", side_effect=fake_send):
+            with patch("bridge.tg.send_message", side_effect=fake_send), \
+                    patch("bridge.tg.pin_chat_message"):
                 await bridge._forward(object(), "MAX | Канал", "Анонс", [],
                                       -999, 5, "Канал", "Канал", "channel")
         self.assertTrue(captured["silent"])  # channel -> no notification
@@ -380,7 +381,8 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
             def fake_send(token, chat_id, body, **kw):
                 captured["silent"] = kw.get("disable_notification")
                 return 1
-            with patch("bridge.tg.send_message", side_effect=fake_send):
+            with patch("bridge.tg.send_message", side_effect=fake_send), \
+                    patch("bridge.tg.pin_chat_message"):
                 await bridge._forward(object(), "MAX | Людмила", "привет", [],
                                       555, 6, "Людмила", "Людмила", "dialog")
         self.assertFalse(captured["silent"])  # real person -> notify
@@ -395,6 +397,53 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(bridge._state.get_topic(555)["muted"])
                 await bridge._handle_command(-100222, 42, "/mute")   # toggle back
                 self.assertFalse(bridge._state.get_topic(555)["muted"])
+
+    def test_mute_markup_label_reflects_action(self):
+        silent = MaxToTelegramBridge._mute_markup(-7, silent=True)["inline_keyboard"][0][0]
+        self.assertEqual(silent["callback_data"], "mute:-7")
+        self.assertIn("Включить", silent["text"])   # currently silent -> turn ON
+        loud = MaxToTelegramBridge._mute_markup(-7, silent=False)["inline_keyboard"][0][0]
+        self.assertIn("Выключить", loud["text"])
+
+    async def test_ensure_control_posts_pinned_button_once(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(-7, thread_id=1, title="Ch", chat_type="channel")
+            with patch("bridge.tg.send_message", return_value=55) as send, \
+                    patch("bridge.tg.pin_chat_message") as pin:
+                await bridge._ensure_control(-7, 1)
+                await bridge._ensure_control(-7, 1)   # second call: already exists
+        send.assert_called_once()
+        pin.assert_called_once()
+        self.assertEqual(bridge._state.get_topic(-7)["control_msg_id"], 55)
+
+    async def test_callback_toggles_mute_and_edits_button(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(-7, thread_id=1, title="Ch", chat_type="channel")
+            cb = {"id": "cb1", "data": "mute:-7",
+                  "message": {"chat": {"id": -100222}, "message_id": 99}}
+            with patch("bridge.tg.edit_message_text") as edit, \
+                    patch("bridge.tg.answer_callback_query") as ans:
+                # channel is silent by default -> tapping unmutes it
+                await bridge._handle_callback(cb)
+                self.assertFalse(bridge._state.get_topic(-7)["muted"])
+                # tap again -> mutes
+                await bridge._handle_callback(cb)
+                self.assertTrue(bridge._state.get_topic(-7)["muted"])
+        self.assertEqual(edit.call_count, 2)
+        self.assertEqual(ans.call_count, 2)
+
+    async def test_callback_from_foreign_chat_ignored(self):
+        bridge = self.make_bridge()
+        cb = {"id": "x", "data": "mute:-7", "message": {"chat": {"id": 99999}, "message_id": 1}}
+        with patch("bridge.tg.answer_callback_query") as ans, \
+                patch("bridge.tg.edit_message_text") as edit:
+            await bridge._handle_callback(cb)
+        edit.assert_not_called()       # not toggled from an unauthorized chat
+        ans.assert_called_once()       # but still acknowledged
 
     def test_mute_overrides_channel_default(self):
         bridge = self.make_bridge()
