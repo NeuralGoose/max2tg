@@ -51,6 +51,7 @@
 - [Возможности](#возможности)
 - [Быстрый старт](#быстрый-старт)
 - [⭐ Режим тем](#-режим-тем)
+- [🎮 Команды](#-команды)
 - [Запуск на сервере 24/7](#запуск-на-сервере-247)
 - [Вопросы и ответы](#вопросы-и-ответы)
 - [Ограничения](#ограничения)
@@ -66,6 +67,7 @@
 | 🔔 **Уведомления** | Пуши о новых сообщениях MAX приходят как обычные уведомления Telegram — на iOS это единственный способ их получать |
 | ↔️ **Двусторонний** | Не просто пересылка — отвечаете **из Telegram**, и сообщение уходит в чат MAX |
 | 🗂 **Темы** | Каждый MAX-чат = отдельная тема Telegram-форума с именем собеседника |
+| 🎮 **Команды** | Вступать в каналы и искать людей прямо из Telegram — `/join`, `/find` |
 | 🖼 **Медиа** | Фото, видео, файлы, стикеры — в обе стороны |
 | 🔒 **Приватно** | Токены и переписка остаются у вас; ничего не уходит на чужие серверы |
 | 🆓 **Бесплатно** | Без подписок, открытый код (MIT) |
@@ -131,6 +133,33 @@ copy(JSON.parse(localStorage.__oneme_auth).token)
 
 Каждый MAX-чат получит свою тему с именем собеседника. Пишете в теме — уходит в
 этот чат MAX; **Reply** (свайп) отправляет ответ цитатой.
+
+---
+
+## 🎮 Команды
+
+Ботом можно **управлять MAX прямо из Telegram** — команды видны в меню по «/»:
+
+| Команда | Что делает |
+|---|---|
+| `/join <ссылка или @username>` | Вступить в **канал / группу / чат** MAX. Новый чат сам станет отдельной темой. |
+| `/find <+телефон \| @ник \| ссылка \| id>` | Найти человека или канал и узнать его **id**. |
+| `/help` · `/start` | Справка и приветствие. |
+
+Примеры:
+
+```
+/join https://max.ru/join/AbCdEf
+/find @max
+/find +79991234567
+```
+
+> ℹ️ **Написать в существующий чат** — сделайте `Reply` (свайп) на пересланном
+> сообщении: уйдёт точно в нужный чат MAX.
+>
+> Начать диалог с **новым** человеком по id (`/dm`) пока отключено: в MAX номер
+> диалога не равен id пользователя, поэтому отправка по id могла бы уйти не тому.
+> Функция ждёт реверса нужного метода MAX.
 
 ---
 
@@ -245,6 +274,8 @@ Docker-образ `ghcr.io/sillkiin/max2tg:latest`. Для локальной с
 - **Two-way.** Incoming MAX messages — text, photos, videos, files, stickers —
   are forwarded to Telegram; reply right from Telegram and it lands in the MAX chat.
 - **Topics.** Each MAX chat becomes its own Telegram forum topic, named after the contact.
+- **Commands.** Drive MAX from Telegram (shown in the "/" menu): `/join <link>` to
+  join a channel/group/chat, `/find <phone | @username | link | id>` to look someone up.
 - **Private & free.** Tokens and messages stay on your machine. Open-source (MIT).
 - **Runs anywhere.** Windows, old Android (Termux), or a 24/7 server. Pull the
   ready image: `docker pull ghcr.io/sillkiin/max2tg:latest`.
