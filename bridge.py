@@ -45,6 +45,7 @@ _HELP_TEXT = (
     "Команды:\n"
     "• /join <ссылка или @username> — вступить в канал / группу / чат MAX\n"
     "• /find <+телефон | @ник | id | ссылка> — найти человека или канал\n"
+    "• /mute — заглушить/включить уведомления для темы (отправьте внутри неё)\n"
     "• /help — эта справка\n\n"
     "💡 Новый диалог по id (/dm) пока в разработке — для существующих чатов "
     "используйте Reply на пересланном сообщении."
@@ -54,6 +55,7 @@ _WELCOME_TEXT = "👋 Привет! Я зеркалю ваш MAX в Telegram.\n\
 _BOT_COMMANDS = [
     {"command": "join", "description": "Вступить в канал/группу/чат MAX по ссылке"},
     {"command": "find", "description": "Найти человека/канал: телефон, @ник, id"},
+    {"command": "mute", "description": "Заглушить/включить уведомления для темы"},
     {"command": "help", "description": "Справка по командам"},
 ]
 
@@ -476,7 +478,7 @@ class MaxToTelegramBridge:
             first_msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, self._forum_chat_id, body,
                 message_thread_id=thread_id,
-                disable_notification=is_channel and self._silent_channels,
+                disable_notification=self._is_silent(chat_id, is_channel),
             )
             self._remember(
                 first_msg_id, chat_id, message_id, sender,
@@ -567,7 +569,7 @@ class MaxToTelegramBridge:
 
         ctx = (client, header, chat_id, max_message_id, sender,
                telegram_chat_id, thread_id, in_topic, is_channel)
-        silent = is_channel and self._silent_channels
+        silent = self._is_silent(chat_id, is_channel)
         header_sent = False
         # A leading text message when there is text, notes, or nothing else.
         if text or notes or (not media and not to_resolve):
@@ -591,6 +593,15 @@ class MaxToTelegramBridge:
     def _caption(header, header_sent, item_text):
         return item_text if header_sent else f"{header}\n{item_text}"
 
+    def _is_silent(self, chat_id, is_channel: bool) -> bool:
+        """Forward this chat's messages without a Telegram notification?
+        A per-chat /mute toggle wins; otherwise channels are silent by default."""
+        topic = self._state.get_topic(chat_id)
+        muted = topic.get("muted") if topic else None
+        if muted is not None:
+            return bool(muted)
+        return bool(is_channel and self._silent_channels)
+
     async def _send_note(self, telegram_chat_id, text, thread_id,
                          disable_notification: bool = False):
         """Send a plain-text note; on failure log at error and return None so a
@@ -608,7 +619,7 @@ class MaxToTelegramBridge:
     async def _send_media_item(self, item, header_sent, ctx) -> bool:
         (_client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
-        silent = is_channel and self._silent_channels
+        silent = self._is_silent(chat_id, is_channel)
         caption = (item.text if header_sent
                    else (self._topic_caption(sender, item.text, is_channel) if in_topic
                          else self._caption(header, header_sent, item.text)))
@@ -635,7 +646,7 @@ class MaxToTelegramBridge:
         """Resolve a file/video to a temporary URL, then upload it to Telegram."""
         (client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
-        silent = is_channel and self._silent_channels
+        silent = self._is_silent(chat_id, is_channel)
         caption = (item.text if header_sent
                    else (self._topic_caption(sender, item.text, is_channel) if in_topic
                          else self._caption(header, header_sent, item.text)))
@@ -871,6 +882,20 @@ class MaxToTelegramBridge:
             return
         if cmd == "help":
             await reply(_HELP_TEXT)
+            return
+        if cmd == "mute":
+            if not thread_id:
+                await reply("🔕 Отправьте /mute внутри темы нужного чата (свайп в форуме).")
+                return
+            topic = self._state.find_by_thread(thread_id)
+            if not topic:
+                await reply("Не нашёл чат для этой темы.")
+                return
+            muted = self._state.set_muted(
+                topic["max_chat_id"], not bool(topic.get("muted")))
+            await reply("🔕 Тема заглушена — сообщения этого чата приходят без звука.\n"
+                        "/mute ещё раз — вернуть звук."
+                        if muted else "🔔 Звук для этой темы включён.")
             return
         if cmd not in ("join", "find", "dm"):
             return  # ignore unknown commands silently (could be Telegram's own)

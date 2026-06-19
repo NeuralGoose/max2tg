@@ -385,6 +385,33 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                                       555, 6, "Людмила", "Людмила", "dialog")
         self.assertFalse(captured["silent"])  # real person -> notify
 
+    async def test_mute_command_toggles_silence(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(555, thread_id=42, title="Людмила", chat_type="dialog")
+            with patch("bridge.tg.send_message", return_value=1):
+                await bridge._handle_command(-100222, 42, "/mute")
+                self.assertTrue(bridge._state.get_topic(555)["muted"])
+                await bridge._handle_command(-100222, 42, "/mute")   # toggle back
+                self.assertFalse(bridge._state.get_topic(555)["muted"])
+
+    def test_mute_overrides_channel_default(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            # channel explicitly UNmuted -> notify (overrides the silent default)
+            bridge._state.save_topic(-7, thread_id=1, title="Ch", chat_type="channel")
+            bridge._state.set_muted(-7, False)
+            self.assertFalse(bridge._is_silent(-7, is_channel=True))
+            # dialog explicitly muted -> silent
+            bridge._state.save_topic(8, thread_id=2, title="P", chat_type="dialog")
+            bridge._state.set_muted(8, True)
+            self.assertTrue(bridge._is_silent(8, is_channel=False))
+            # untouched channel -> default silent
+            bridge._state.save_topic(-9, thread_id=3, title="Ch2", chat_type="channel")
+            self.assertTrue(bridge._is_silent(-9, is_channel=True))
+
     async def test_media_inside_topic_uploads_file_to_max_chat(self):
         bridge = self.make_bridge()
         with tempfile.TemporaryDirectory() as tmp:

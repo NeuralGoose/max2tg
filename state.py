@@ -113,6 +113,18 @@ class BridgeState:
                 return topic
         return None
 
+    def set_muted(self, max_chat_id: int | str, muted: bool) -> bool:
+        """Set the per-chat mute flag (True = forward silently). Returns the new
+        value; no-op if the chat has no topic yet."""
+        topic = self.get_topic(max_chat_id)
+        if not topic:
+            return bool(muted)
+        topic["muted"] = bool(muted)
+        topic["updated_at"] = int(time.time())
+        self._data["topics"][str(max_chat_id)] = topic
+        self.save()
+        return bool(muted)
+
 
 def normalize_topic_title(value: str, fallback: str) -> str:
     title = " ".join((value or "").split()) or fallback
