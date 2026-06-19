@@ -16,6 +16,7 @@ from vkmax.functions.messages import send_message as max_send
 from vkmax.functions.users import resolve_users
 
 import attaches
+import maxactions
 import mediamax
 import tg
 from max_client import BrowserMaxClient, MaxAuthError
@@ -35,6 +36,26 @@ MEDIA_CONCURRENCY = 8
 TELEGRAM_UPLOAD_LIMIT = 49 * 1024 * 1024
 ATTACH_DEBUG_LOG = Path(__file__).parent / "attaches.log"
 ATTACH_DEBUG_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+# Owner-only Telegram commands to drive MAX (join chats, find people, start DMs).
+_HELP_TEXT = (
+    "🤖 Что я умею\n\n"
+    "📥 Присылаю сюда сообщения из MAX.\n"
+    "↩️ Чтобы написать в чат MAX — сделайте Reply (свайп) на пересланном сообщении.\n\n"
+    "Команды:\n"
+    "• /join <ссылка или @username> — вступить в канал / группу / чат MAX\n"
+    "• /find <+телефон | @ник | id | ссылка> — найти человека или канал\n"
+    "• /help — эта справка\n\n"
+    "💡 Новый диалог по id (/dm) пока в разработке — для существующих чатов "
+    "используйте Reply на пересланном сообщении."
+)
+_WELCOME_TEXT = "👋 Привет! Я зеркалю ваш MAX в Telegram.\n\n" + _HELP_TEXT
+# Registered in Telegram's "/" menu so the commands are discoverable.
+_BOT_COMMANDS = [
+    {"command": "join", "description": "Вступить в канал/группу/чат MAX по ссылке"},
+    {"command": "find", "description": "Найти человека/канал: телефон, @ник, id"},
+    {"command": "help", "description": "Справка по командам"},
+]
 
 # kind -> (tg function, supports_caption)
 _MEDIA_SENDERS = {
@@ -394,9 +415,20 @@ class MaxToTelegramBridge:
             return self._forum_chat_id, thread_id, True
 
     @staticmethod
-    def _topic_body(sender: str, text: str, notes: list[str]) -> str:
+    def _topic_body(sender: str, text: str, notes: list[str],
+                    is_channel: bool = False) -> str:
         body = "\n".join(part for part in [text, *notes] if part)
+        if is_channel:
+            # A channel has a single author (the channel itself, already shown as
+            # the topic), so the "{sender}:" prefix would just duplicate it.
+            return body or sender
         return f"{sender}:\n{body}" if body else f"{sender}:"
+
+    @staticmethod
+    def _topic_caption(sender: str, item_text: str, is_channel: bool) -> str:
+        """First media item's caption inside a topic: a '{sender}:' label, except
+        in a channel where it would duplicate the channel name shown as the topic."""
+        return item_text if is_channel else f"{sender}:\n{item_text}"
 
     async def _message_sender_name(self, client: MaxClient, sender_id) -> str:
         if sender_id is not None and sender_id == self._own_id:
@@ -431,11 +463,12 @@ class MaxToTelegramBridge:
         if not text and not notes and not media and not to_resolve:
             return False
 
+        is_channel = topic.get("chat_type") == "channel"
         sender = await self._message_sender_name(client, message.get("sender"))
         first_msg_id = None
         header_sent = False
         if text or notes or (not media and not to_resolve):
-            body = self._topic_body(sender, text, notes)
+            body = self._topic_body(sender, text, notes, is_channel)
             first_msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, self._forum_chat_id, body,
                 message_thread_id=thread_id,
@@ -448,7 +481,7 @@ class MaxToTelegramBridge:
 
         ctx = (
             client, f"MAX | {sender} (chat {chat_id})", chat_id, message_id, sender,
-            self._forum_chat_id, thread_id, True,
+            self._forum_chat_id, thread_id, True, is_channel,
         )
         for item in media:
             header_sent = await self._send_media_item(item, header_sent, ctx)
@@ -523,13 +556,16 @@ class MaxToTelegramBridge:
         telegram_chat_id, thread_id, in_topic = await self._telegram_target(
             chat_id, chat_title, chat_type, sender
         )
+        topic = self._state.get_topic(chat_id) if in_topic else None
+        is_channel = (chat_type == "channel"
+                      or bool(topic and topic.get("chat_type") == "channel"))
 
         ctx = (client, header, chat_id, max_message_id, sender,
-               telegram_chat_id, thread_id, in_topic)
+               telegram_chat_id, thread_id, in_topic, is_channel)
         header_sent = False
         # A leading text message when there is text, notes, or nothing else.
         if text or notes or (not media and not to_resolve):
-            body = (self._topic_body(sender, text, notes)
+            body = (self._topic_body(sender, text, notes, is_channel)
                     if in_topic else
                     ("\n".join(part for part in [header, text, *notes] if part) or header))
             msg_id = await asyncio.to_thread(tg.send_message, self._token,
@@ -561,9 +597,11 @@ class MaxToTelegramBridge:
             return None
 
     async def _send_media_item(self, item, header_sent, ctx) -> bool:
-        _client, header, chat_id, max_message_id, sender, telegram_chat_id, thread_id, in_topic = ctx
-        caption = (item.text if header_sent else f"{sender}:\n{item.text}"
-                   if in_topic else self._caption(header, header_sent, item.text))
+        (_client, header, chat_id, max_message_id, sender, telegram_chat_id,
+         thread_id, in_topic, is_channel) = ctx
+        caption = (item.text if header_sent
+                   else (self._topic_caption(sender, item.text, is_channel) if in_topic
+                         else self._caption(header, header_sent, item.text)))
         sender_fn, supports_caption = _MEDIA_SENDERS[item.kind]
         try:
             if supports_caption:
@@ -585,9 +623,11 @@ class MaxToTelegramBridge:
 
     async def _send_resolved_item(self, item, header_sent, ctx) -> bool:
         """Resolve a file/video to a temporary URL, then upload it to Telegram."""
-        client, header, chat_id, max_message_id, sender, telegram_chat_id, thread_id, in_topic = ctx
-        caption = (item.text if header_sent else f"{sender}:\n{item.text}"
-                   if in_topic else self._caption(header, header_sent, item.text))
+        (client, header, chat_id, max_message_id, sender, telegram_chat_id,
+         thread_id, in_topic, is_channel) = ctx
+        caption = (item.text if header_sent
+                   else (self._topic_caption(sender, item.text, is_channel) if in_topic
+                         else self._caption(header, header_sent, item.text)))
         if item.size and item.size > TELEGRAM_UPLOAD_LIMIT:
             msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, telegram_chat_id,
@@ -791,6 +831,58 @@ class MaxToTelegramBridge:
         if text:
             await self._send_reply_to_max(target, text)
 
+    async def _register_commands(self) -> None:
+        """Publish the command list to Telegram's "/" menu (once, best-effort)."""
+        try:
+            await asyncio.to_thread(tg.set_my_commands, self._token, _BOT_COMMANDS)
+        except Exception as exc:
+            _logger.warning("Could not register bot commands: %s", exc)
+
+    async def _handle_command(self, incoming_chat, thread_id, text: str) -> None:
+        """Owner-only slash commands that drive MAX (join/find/dm). Caller already
+        verified the message came from an allowed chat."""
+        parts = text.strip().split(maxsplit=2)
+        cmd = parts[0].lower().lstrip("/").split("@", 1)[0]  # tolerate /cmd@botname
+
+        async def reply(msg: str):
+            try:
+                return await asyncio.to_thread(
+                    tg.send_message, self._token, incoming_chat, msg,
+                    message_thread_id=thread_id)
+            except Exception as exc:
+                _logger.error("Could not send command reply: %s", exc)
+                return None
+
+        if cmd == "start":
+            await reply(_WELCOME_TEXT)
+            return
+        if cmd == "help":
+            await reply(_HELP_TEXT)
+            return
+        if cmd not in ("join", "find", "dm"):
+            return  # ignore unknown commands silently (could be Telegram's own)
+        client = self._client
+        if client is None:
+            await reply("⏳ MAX ещё подключается — попробуйте через минуту.")
+            return
+        if cmd == "join":
+            if len(parts) < 2:
+                await reply("Использование: /join <ссылка max.ru/… или @username>")
+                return
+            result = await maxactions.join(client, parts[1])
+        elif cmd == "find":
+            if len(parts) < 2:
+                await reply("Использование: /find <+телефон | @ник | id | ссылка>")
+                return
+            result = await maxactions.find(client, " ".join(parts[1:]))
+        else:  # dm
+            if len(parts) < 3:
+                await reply("Использование: /dm <id> <текст>")
+                return
+            result = await maxactions.start_dm(client, parts[1], parts[2])
+
+        await reply(result.text)
+
     async def _handle_update(self, update: dict) -> None:
         message = update.get("message")
         if not message:
@@ -805,6 +897,8 @@ class MaxToTelegramBridge:
             return
         text = self._telegram_outgoing_text(message)
         if text.startswith("/"):
+            await self._handle_command(
+                incoming_chat, message.get("message_thread_id"), text)
             return
         # Act on real content, not on the display note: an attachment with no
         # caption (and no media-note label) must still be routed to MAX.
@@ -927,4 +1021,5 @@ class MaxToTelegramBridge:
             await asyncio.sleep(delay)
 
     async def run_forever(self) -> None:
+        await self._register_commands()
         await asyncio.gather(self._max_loop(), self._poll_telegram())

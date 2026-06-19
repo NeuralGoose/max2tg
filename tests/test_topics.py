@@ -83,6 +83,26 @@ class ContactNameTests(unittest.TestCase):
         self.assertEqual(_contact_display_name(contact), "Инна Кладова")
 
 
+class TopicBodyTests(unittest.TestCase):
+    def test_group_keeps_sender_prefix(self):
+        self.assertEqual(
+            MaxToTelegramBridge._topic_body("Иван", "привет", []), "Иван:\nпривет")
+
+    def test_channel_drops_redundant_sender_prefix(self):
+        # A channel post (sender == "MAX") must NOT get the "MAX:" prefix that
+        # just duplicates the channel name shown above the message.
+        self.assertEqual(
+            MaxToTelegramBridge._topic_body("MAX", "Афиша на выходные", [], is_channel=True),
+            "Афиша на выходные")
+
+    def test_channel_media_caption_has_no_prefix(self):
+        self.assertEqual(
+            MaxToTelegramBridge._topic_caption("MAX", "Фото", is_channel=True), "Фото")
+        self.assertEqual(
+            MaxToTelegramBridge._topic_caption("Иван", "Фото", is_channel=False),
+            "Иван:\nФото")
+
+
 class TopicStateTests(unittest.TestCase):
     def test_state_roundtrip_and_find_by_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,6 +288,25 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
         # A valid-JSON but non-dict frame must be ignored cleanly, not raise
         # AttributeError out of the fire-and-forget handler task.
         await bridge._on_packet(client, [1, 2, 3])  # must not raise
+
+    async def test_find_command_does_not_remember_dm_target(self):
+        # /find must NOT create a reply_map send-target from a user-supplied id
+        # (a MAX user_id is not a dialog chatId).
+        import maxactions
+        bridge = self.make_bridge()
+        bridge._client = object()
+        result = maxactions.CommandResult("🔍 Нашёл: Пётр\n🆔 id: 777")
+        with patch("bridge.tg.send_message", return_value=42), \
+                patch("bridge.maxactions.find", new=AsyncMock(return_value=result)):
+            await bridge._handle_command(111, None, "/find 777")
+        self.assertNotIn(42, bridge._reply_map)
+
+    async def test_help_command_replies(self):
+        bridge = self.make_bridge()
+        sent = []
+        with patch("bridge.tg.send_message", side_effect=lambda *a, **k: sent.append(a[2])):
+            await bridge._handle_command(111, None, "/help")
+        self.assertTrue(sent and "/join" in sent[0])
 
     async def test_falls_back_when_topic_creation_fails(self):
         bridge = self.make_bridge()

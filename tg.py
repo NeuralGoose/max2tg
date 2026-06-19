@@ -107,6 +107,14 @@ def check_token(token: str) -> dict:
     return _call(token, "getMe")
 
 
+def set_my_commands(token: str, commands: list[dict]) -> None:
+    """Register the bot's command list so Telegram shows it in the '/' menu.
+
+    commands: [{"command": "join", "description": "..."}, ...] (lowercase, no slash).
+    """
+    _call(token, "setMyCommands", commands=commands)
+
+
 def get_updates(token: str, offset: int | None = None, timeout: int = 25) -> list[dict]:
     params = {"timeout": timeout, "allowed_updates": ["message"]}
     if offset is not None:
