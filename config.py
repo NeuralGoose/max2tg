@@ -66,10 +66,6 @@ def normalize_config(data: dict) -> dict:
         result.get("telegram_confirm_sent"),
         default=True,
     )
-    result["telegram_silent_channels"] = _coerce_bool(
-        result.get("telegram_silent_channels"),
-        default=True,
-    )
     return result
 
 _logger = logging.getLogger(__name__)
@@ -123,7 +119,6 @@ ENV_MAP = {
     "telegram_preload_chat_count": "MAX2TG_TELEGRAM_PRELOAD_CHAT_COUNT",
     "telegram_resync_titles": "MAX2TG_TELEGRAM_RESYNC_TITLES",
     "telegram_confirm_sent": "MAX2TG_TELEGRAM_CONFIRM_SENT",
-    "telegram_silent_channels": "MAX2TG_TELEGRAM_SILENT_CHANNELS",
 }
 
 

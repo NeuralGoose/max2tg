@@ -45,7 +45,6 @@ _HELP_TEXT = (
     "Команды:\n"
     "• /join <ссылка или @username> — вступить в канал / группу / чат MAX\n"
     "• /find <+телефон | @ник | id | ссылка> — найти человека или канал\n"
-    "• /mute — заглушить/включить уведомления для темы (отправьте внутри неё)\n"
     "• /help — эта справка\n\n"
     "💡 Новый диалог по id (/dm) пока в разработке — для существующих чатов "
     "используйте Reply на пересланном сообщении."
@@ -55,7 +54,6 @@ _WELCOME_TEXT = "👋 Привет! Я зеркалю ваш MAX в Telegram.\n\
 _BOT_COMMANDS = [
     {"command": "join", "description": "Вступить в канал/группу/чат MAX по ссылке"},
     {"command": "find", "description": "Найти человека/канал: телефон, @ник, id"},
-    {"command": "mute", "description": "Заглушить/включить уведомления для темы"},
     {"command": "help", "description": "Справка по командам"},
 ]
 
@@ -140,10 +138,6 @@ class MaxToTelegramBridge:
         # Send a "✅ Отправлено в MAX" confirmation after each Telegram->MAX
         # message. Set false to keep topics clean (errors are still shown).
         self._confirm_sent = config.get("telegram_confirm_sent", True)
-        # Channels are announcement feeds — forward their posts silently (no
-        # Telegram notification) by default so they don't ping. Real people
-        # (dialogs/groups) still notify. Set false to notify for channels too.
-        self._silent_channels = bool(config.get("telegram_silent_channels", True))
         self._own_id: int | None = None
         # Bounded LRU so a long-running process can't grow the cache forever.
         self._name_cache: "OrderedDict[int, str]" = OrderedDict()
@@ -478,7 +472,6 @@ class MaxToTelegramBridge:
             first_msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, self._forum_chat_id, body,
                 message_thread_id=thread_id,
-                disable_notification=self._is_silent(chat_id, is_channel),
             )
             self._remember(
                 first_msg_id, chat_id, message_id, sender,
@@ -563,15 +556,12 @@ class MaxToTelegramBridge:
         telegram_chat_id, thread_id, in_topic = await self._telegram_target(
             chat_id, chat_title, chat_type, sender
         )
-        if in_topic:
-            await self._ensure_control(chat_id, thread_id)
         topic = self._state.get_topic(chat_id) if in_topic else None
         is_channel = (chat_type == "channel"
                       or bool(topic and topic.get("chat_type") == "channel"))
 
         ctx = (client, header, chat_id, max_message_id, sender,
                telegram_chat_id, thread_id, in_topic, is_channel)
-        silent = self._is_silent(chat_id, is_channel)
         header_sent = False
         # A leading text message when there is text, notes, or nothing else.
         if text or notes or (not media and not to_resolve):
@@ -580,8 +570,7 @@ class MaxToTelegramBridge:
                     ("\n".join(part for part in [header, text, *notes] if part) or header))
             msg_id = await asyncio.to_thread(tg.send_message, self._token,
                                              telegram_chat_id, body,
-                                             message_thread_id=thread_id,
-                                             disable_notification=silent)
+                                             message_thread_id=thread_id)
             self._remember(msg_id, chat_id, max_message_id, sender,
                            telegram_chat_id, thread_id)
             header_sent = True
@@ -595,115 +584,13 @@ class MaxToTelegramBridge:
     def _caption(header, header_sent, item_text):
         return item_text if header_sent else f"{header}\n{item_text}"
 
-    def _is_silent(self, chat_id, is_channel: bool) -> bool:
-        """Forward this chat's messages without a Telegram notification?
-        A per-chat /mute toggle wins; otherwise channels are silent by default."""
-        topic = self._state.get_topic(chat_id)
-        muted = topic.get("muted") if topic else None
-        if muted is not None:
-            return bool(muted)
-        return bool(is_channel and self._silent_channels)
-
-    @staticmethod
-    def _mute_markup(chat_id, silent: bool) -> dict:
-        """Inline keyboard with one mute-toggle button (label shows the action)."""
-        label = "🔔 Включить звук" if silent else "🔕 Выключить звук"
-        return {"inline_keyboard": [[
-            {"text": label, "callback_data": f"mute:{chat_id}"}]]}
-
-    async def _ensure_control(self, chat_id, thread_id) -> None:
-        """Post (once per topic) a pinned message with a mute-toggle button — like
-        a channel's "Вкл./Выкл. звук". Lazy: created on the topic's first forward."""
-        topic = self._state.get_topic(chat_id)
-        if not topic or topic.get("control_msg_id") or not self._forum_chat_id:
-            return  # fast path (no lock): control already exists / no forum
-        # Serialize per chat: two concurrent first-forwards from the same new
-        # chat would both pass the check above and double-post/double-pin. The
-        # hot path never reaches here, so the lock stays off the common case.
-        async with self._topic_lock(chat_id):
-            topic = self._state.get_topic(chat_id)
-            if not topic or topic.get("control_msg_id"):
-                return
-            silent = self._is_silent(chat_id, topic.get("chat_type") == "channel")
-            try:
-                msg_id = await asyncio.to_thread(
-                    tg.send_message, self._token, self._forum_chat_id,
-                    "🔔 Уведомления этого чата:", message_thread_id=thread_id,
-                    disable_notification=True,
-                    reply_markup=self._mute_markup(chat_id, silent))
-            except Exception as exc:
-                _logger.warning("control button post failed for %s: %s", chat_id, exc)
-                return
-            if not msg_id:
-                return
-            self._state.set_control_message(chat_id, msg_id)
-            try:
-                await asyncio.to_thread(
-                    tg.pin_chat_message, self._token, self._forum_chat_id, msg_id)
-            except Exception as exc:
-                _logger.info("pin control failed for %s: %s", chat_id, exc)
-
-    async def _refresh_control_button(self, max_chat_id, new_muted,
-                                      message_id: int | None = None) -> None:
-        """Re-label the pinned control button to match the new mute state. Shared
-        by the inline tap and /mute so the two paths never show divergent labels."""
-        topic = self._state.get_topic(max_chat_id)
-        target_id = (topic.get("control_msg_id") if topic else None) or message_id
-        if not target_id or not self._forum_chat_id:
-            return
-        try:
-            await asyncio.to_thread(
-                tg.edit_message_text, self._token, self._forum_chat_id, target_id,
-                "🔔 Уведомления этого чата:",
-                reply_markup=self._mute_markup(max_chat_id, new_muted))
-        except Exception as exc:
-            _logger.info("refresh control button failed: %s", exc)
-
-    async def _handle_callback(self, cb: dict) -> None:
-        """Handle an inline mute-button tap (callback_query)."""
-        cb_id = cb.get("id")
-        data = cb.get("data") or ""
-        msg = cb.get("message") or {}
-        chat = msg.get("chat", {}).get("id")
-        allowed = {str(self._chat_id), str(self._fallback_chat_id)}
-        if self._forum_chat_id:
-            allowed.add(str(self._forum_chat_id))
-
-        async def ack(text=None):
-            if cb_id:
-                try:
-                    await asyncio.to_thread(
-                        tg.answer_callback_query, self._token, cb_id, text)
-                except Exception:
-                    pass
-
-        if str(chat) not in allowed or not data.startswith("mute:"):
-            await ack()
-            return
-        try:
-            max_chat_id = int(data.split(":", 1)[1])
-        except (ValueError, IndexError):
-            await ack()
-            return
-        topic = self._state.get_topic(max_chat_id)
-        if not topic:
-            await ack("Чат не найден")
-            return
-        is_channel = topic.get("chat_type") == "channel"
-        new_muted = not self._is_silent(max_chat_id, is_channel)
-        self._state.set_muted(max_chat_id, new_muted)
-        await self._refresh_control_button(max_chat_id, new_muted, msg.get("message_id"))
-        await ack("🔕 Без звука" if new_muted else "🔔 Со звуком")
-
-    async def _send_note(self, telegram_chat_id, text, thread_id,
-                         disable_notification: bool = False):
+    async def _send_note(self, telegram_chat_id, text, thread_id):
         """Send a plain-text note; on failure log at error and return None so a
         broken Telegram destination is visible instead of silently dropped."""
         try:
             return await asyncio.to_thread(
                 tg.send_message, self._token, telegram_chat_id, text,
-                message_thread_id=thread_id,
-                disable_notification=disable_notification)
+                message_thread_id=thread_id)
         except Exception as exc:
             _logger.error("Could not deliver note to Telegram chat %s: %s",
                           telegram_chat_id, exc)
@@ -712,7 +599,6 @@ class MaxToTelegramBridge:
     async def _send_media_item(self, item, header_sent, ctx) -> bool:
         (_client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
-        silent = self._is_silent(chat_id, is_channel)
         caption = (item.text if header_sent
                    else (self._topic_caption(sender, item.text, is_channel) if in_topic
                          else self._caption(header, header_sent, item.text)))
@@ -721,16 +607,16 @@ class MaxToTelegramBridge:
             if supports_caption:
                 msg_id = await asyncio.to_thread(
                     sender_fn, self._token, telegram_chat_id, item.url, caption,
-                    message_thread_id=thread_id, disable_notification=silent)
+                    message_thread_id=thread_id)
             else:
                 msg_id = await asyncio.to_thread(
                     sender_fn, self._token, telegram_chat_id, item.url,
-                    message_thread_id=thread_id, disable_notification=silent)
+                    message_thread_id=thread_id)
         except Exception as exc:
             _logger.warning("Failed to send %s: %s", item.kind, exc)
             msg_id = await self._send_note(
                 telegram_chat_id, f"{caption} [не удалось переслать медиа]",
-                thread_id, disable_notification=silent)
+                thread_id)
         self._remember(msg_id, chat_id, max_message_id, sender,
                        telegram_chat_id, thread_id)
         return True
@@ -739,7 +625,6 @@ class MaxToTelegramBridge:
         """Resolve a file/video to a temporary URL, then upload it to Telegram."""
         (client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
-        silent = self._is_silent(chat_id, is_channel)
         caption = (item.text if header_sent
                    else (self._topic_caption(sender, item.text, is_channel) if in_topic
                          else self._caption(header, header_sent, item.text)))
@@ -747,7 +632,7 @@ class MaxToTelegramBridge:
             msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, telegram_chat_id,
                 f"{caption} [слишком большой для Telegram] — открыть в MAX",
-                message_thread_id=thread_id, disable_notification=silent)
+                message_thread_id=thread_id)
             self._remember(msg_id, chat_id, max_message_id, sender,
                            telegram_chat_id, thread_id)
             return True
@@ -757,19 +642,17 @@ class MaxToTelegramBridge:
                     client, item.file_id, chat_id, max_message_id)
                 msg_id = await asyncio.to_thread(
                     tg.send_document, self._token, telegram_chat_id, url,
-                    caption, item.filename, message_thread_id=thread_id,
-                    disable_notification=silent)
+                    caption, item.filename, message_thread_id=thread_id)
             else:  # video_resolve
                 url = await mediamax.resolve_video_url(
                     client, item.video_id, chat_id, max_message_id)
                 msg_id = await asyncio.to_thread(
                     tg.send_video, self._token, telegram_chat_id, url, caption,
-                    message_thread_id=thread_id, disable_notification=silent)
+                    message_thread_id=thread_id)
         except Exception as exc:
             _logger.warning("Failed to resolve/send %s: %s", item.kind, exc)
             msg_id = await self._send_note(
-                telegram_chat_id, f"{caption} — открыть в MAX", thread_id,
-                disable_notification=silent)
+                telegram_chat_id, f"{caption} — открыть в MAX", thread_id)
         self._remember(msg_id, chat_id, max_message_id, sender,
                        telegram_chat_id, thread_id)
         return True
@@ -976,25 +859,6 @@ class MaxToTelegramBridge:
         if cmd == "help":
             await reply(_HELP_TEXT)
             return
-        if cmd == "mute":
-            if not thread_id:
-                await reply("🔕 Отправьте /mute внутри темы нужного чата (свайп в форуме).")
-                return
-            topic = self._state.find_by_thread(thread_id)
-            if not topic:
-                await reply("Не нашёл чат для этой темы.")
-                return
-            max_chat_id = topic["max_chat_id"]
-            is_channel = topic.get("chat_type") == "channel"
-            # Toggle on the *effective* state (same basis as the inline button) so
-            # /mute and the button never disagree on a silent-by-default channel.
-            new_muted = not self._is_silent(max_chat_id, is_channel)
-            self._state.set_muted(max_chat_id, new_muted)
-            await self._refresh_control_button(max_chat_id, new_muted)
-            await reply("🔕 Тема заглушена — сообщения этого чата приходят без звука.\n"
-                        "/mute ещё раз — вернуть звук."
-                        if new_muted else "🔔 Звук для этой темы включён.")
-            return
         if cmd not in ("join", "find", "dm"):
             return  # ignore unknown commands silently (could be Telegram's own)
         client = self._client
@@ -1091,10 +955,7 @@ class MaxToTelegramBridge:
                     continue  # advance past anything malformed
                 offset = uid + 1
                 try:
-                    if "callback_query" in update:
-                        await self._handle_callback(update["callback_query"])
-                    else:
-                        await self._handle_update(update)
+                    await self._handle_update(update)
                 except Exception:
                     _logger.exception("Failed to handle Telegram update")
 
