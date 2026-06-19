@@ -138,6 +138,10 @@ class MaxToTelegramBridge:
         # Send a "✅ Отправлено в MAX" confirmation after each Telegram->MAX
         # message. Set false to keep topics clean (errors are still shown).
         self._confirm_sent = config.get("telegram_confirm_sent", True)
+        # Channels are announcement feeds — forward their posts silently (no
+        # Telegram notification) by default so they don't ping. Real people
+        # (dialogs/groups) still notify. Set false to notify for channels too.
+        self._silent_channels = bool(config.get("telegram_silent_channels", True))
         self._own_id: int | None = None
         # Bounded LRU so a long-running process can't grow the cache forever.
         self._name_cache: "OrderedDict[int, str]" = OrderedDict()
@@ -472,6 +476,7 @@ class MaxToTelegramBridge:
             first_msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, self._forum_chat_id, body,
                 message_thread_id=thread_id,
+                disable_notification=is_channel and self._silent_channels,
             )
             self._remember(
                 first_msg_id, chat_id, message_id, sender,
@@ -562,6 +567,7 @@ class MaxToTelegramBridge:
 
         ctx = (client, header, chat_id, max_message_id, sender,
                telegram_chat_id, thread_id, in_topic, is_channel)
+        silent = is_channel and self._silent_channels
         header_sent = False
         # A leading text message when there is text, notes, or nothing else.
         if text or notes or (not media and not to_resolve):
@@ -570,7 +576,8 @@ class MaxToTelegramBridge:
                     ("\n".join(part for part in [header, text, *notes] if part) or header))
             msg_id = await asyncio.to_thread(tg.send_message, self._token,
                                              telegram_chat_id, body,
-                                             message_thread_id=thread_id)
+                                             message_thread_id=thread_id,
+                                             disable_notification=silent)
             self._remember(msg_id, chat_id, max_message_id, sender,
                            telegram_chat_id, thread_id)
             header_sent = True
@@ -584,13 +591,15 @@ class MaxToTelegramBridge:
     def _caption(header, header_sent, item_text):
         return item_text if header_sent else f"{header}\n{item_text}"
 
-    async def _send_note(self, telegram_chat_id, text, thread_id):
+    async def _send_note(self, telegram_chat_id, text, thread_id,
+                         disable_notification: bool = False):
         """Send a plain-text note; on failure log at error and return None so a
         broken Telegram destination is visible instead of silently dropped."""
         try:
             return await asyncio.to_thread(
                 tg.send_message, self._token, telegram_chat_id, text,
-                message_thread_id=thread_id)
+                message_thread_id=thread_id,
+                disable_notification=disable_notification)
         except Exception as exc:
             _logger.error("Could not deliver note to Telegram chat %s: %s",
                           telegram_chat_id, exc)
@@ -599,6 +608,7 @@ class MaxToTelegramBridge:
     async def _send_media_item(self, item, header_sent, ctx) -> bool:
         (_client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
+        silent = is_channel and self._silent_channels
         caption = (item.text if header_sent
                    else (self._topic_caption(sender, item.text, is_channel) if in_topic
                          else self._caption(header, header_sent, item.text)))
@@ -607,16 +617,16 @@ class MaxToTelegramBridge:
             if supports_caption:
                 msg_id = await asyncio.to_thread(
                     sender_fn, self._token, telegram_chat_id, item.url, caption,
-                    message_thread_id=thread_id)
+                    message_thread_id=thread_id, disable_notification=silent)
             else:
                 msg_id = await asyncio.to_thread(
                     sender_fn, self._token, telegram_chat_id, item.url,
-                    message_thread_id=thread_id)
+                    message_thread_id=thread_id, disable_notification=silent)
         except Exception as exc:
             _logger.warning("Failed to send %s: %s", item.kind, exc)
             msg_id = await self._send_note(
                 telegram_chat_id, f"{caption} [не удалось переслать медиа]",
-                thread_id)
+                thread_id, disable_notification=silent)
         self._remember(msg_id, chat_id, max_message_id, sender,
                        telegram_chat_id, thread_id)
         return True
@@ -625,6 +635,7 @@ class MaxToTelegramBridge:
         """Resolve a file/video to a temporary URL, then upload it to Telegram."""
         (client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
+        silent = is_channel and self._silent_channels
         caption = (item.text if header_sent
                    else (self._topic_caption(sender, item.text, is_channel) if in_topic
                          else self._caption(header, header_sent, item.text)))
@@ -632,7 +643,7 @@ class MaxToTelegramBridge:
             msg_id = await asyncio.to_thread(
                 tg.send_message, self._token, telegram_chat_id,
                 f"{caption} [слишком большой для Telegram] — открыть в MAX",
-                message_thread_id=thread_id)
+                message_thread_id=thread_id, disable_notification=silent)
             self._remember(msg_id, chat_id, max_message_id, sender,
                            telegram_chat_id, thread_id)
             return True
@@ -642,17 +653,19 @@ class MaxToTelegramBridge:
                     client, item.file_id, chat_id, max_message_id)
                 msg_id = await asyncio.to_thread(
                     tg.send_document, self._token, telegram_chat_id, url,
-                    caption, item.filename, message_thread_id=thread_id)
+                    caption, item.filename, message_thread_id=thread_id,
+                    disable_notification=silent)
             else:  # video_resolve
                 url = await mediamax.resolve_video_url(
                     client, item.video_id, chat_id, max_message_id)
                 msg_id = await asyncio.to_thread(
                     tg.send_video, self._token, telegram_chat_id, url, caption,
-                    message_thread_id=thread_id)
+                    message_thread_id=thread_id, disable_notification=silent)
         except Exception as exc:
             _logger.warning("Failed to resolve/send %s: %s", item.kind, exc)
             msg_id = await self._send_note(
-                telegram_chat_id, f"{caption} — открыть в MAX", thread_id)
+                telegram_chat_id, f"{caption} — открыть в MAX", thread_id,
+                disable_notification=silent)
         self._remember(msg_id, chat_id, max_message_id, sender,
                        telegram_chat_id, thread_id)
         return True

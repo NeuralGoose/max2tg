@@ -213,6 +213,14 @@ class ConfigTests(unittest.TestCase):
         })
         self.assertTrue(config["telegram_confirm_sent"])
 
+    def test_silent_channels_defaults_to_true(self):
+        config = normalize_config({
+            "telegram_bot_token": "token",
+            "telegram_chat_id": "123",
+            "max_login_token": "max",
+        })
+        self.assertTrue(config["telegram_silent_channels"])
+
     def test_corrupt_config_is_logged(self):
         import config as config_module
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,6 +354,36 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                 await bridge._handle_update(update)
 
             max_send.assert_awaited_once_with(bridge._client, 555, "Привет из Telegram")
+
+    async def test_channel_forward_is_silent(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(-999, thread_id=7, title="Канал", chat_type="channel")
+            captured = {}
+
+            def fake_send(token, chat_id, body, **kw):
+                captured["silent"] = kw.get("disable_notification")
+                return 1
+            with patch("bridge.tg.send_message", side_effect=fake_send):
+                await bridge._forward(object(), "MAX | Канал", "Анонс", [],
+                                      -999, 5, "Канал", "Канал", "channel")
+        self.assertTrue(captured["silent"])  # channel -> no notification
+
+    async def test_dialog_forward_notifies(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(555, thread_id=8, title="Людмила", chat_type="dialog")
+            captured = {}
+
+            def fake_send(token, chat_id, body, **kw):
+                captured["silent"] = kw.get("disable_notification")
+                return 1
+            with patch("bridge.tg.send_message", side_effect=fake_send):
+                await bridge._forward(object(), "MAX | Людмила", "привет", [],
+                                      555, 6, "Людмила", "Людмила", "dialog")
+        self.assertFalse(captured["silent"])  # real person -> notify
 
     async def test_media_inside_topic_uploads_file_to_max_chat(self):
         bridge = self.make_bridge()
