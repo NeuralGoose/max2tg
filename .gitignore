@@ -6,3 +6,4 @@ config.json
 state.json
 .env
 _*.py
+_*.txt
