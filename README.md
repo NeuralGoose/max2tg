@@ -149,9 +149,10 @@ copy(JSON.parse(localStorage.__oneme_auth).token)
 Примеры:
 
 ```
-/join https://max.ru/join/AbCdEf
-/find @max
-/find +79991234567
+/join https://max.ru/join/AbCdEf   # вступить в канал/чат по ссылке
+/find https://max.ru/join/AbCdEf   # что за канал/чат по ссылке — без вступления
+/find @ivan                        # найти человека по нику → узнать id
+/find +79991234567                 # найти человека по телефону → узнать id
 ```
 
 > ℹ️ **Написать в существующий чат** — сделайте `Reply` (свайп) на пересланном
@@ -285,8 +286,9 @@ Docker-образ `ghcr.io/sillkiin/max2tg:latest`. Для локальной с
 - **Two-way.** Incoming MAX messages — text, photos, videos, files, stickers —
   are forwarded to Telegram; reply right from Telegram and it lands in the MAX chat.
 - **Topics.** Each MAX chat becomes its own Telegram forum topic, named after the contact.
-- **Commands.** Drive MAX from Telegram (shown in the "/" menu): `/join <link>` to
-  join a channel/group/chat, `/find <phone | @username | link | id>` to look someone up.
+- **Commands** (shown in the "/" menu): `/join <link | @username>` — join a MAX
+  channel/group/chat · `/find <phone | @username | link | id>` — look up a person or
+  channel and get their id · `/help` — command reference.
 - **Private & free.** Tokens and messages stay on your machine. Open-source (MIT).
 - **Runs anywhere.** Windows, old Android (Termux), or a 24/7 server. Pull the
   ready image: `docker pull ghcr.io/sillkiin/max2tg:latest`.
