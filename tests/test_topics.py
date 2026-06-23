@@ -103,6 +103,34 @@ class TopicBodyTests(unittest.TestCase):
             "Иван:\nФото")
 
 
+class SmartActionTests(unittest.TestCase):
+    def test_max_link_becomes_join(self):
+        self.assertEqual(
+            MaxToTelegramBridge._smart_action("https://max.ru/join/AbC-d_e"),
+            "/join https://max.ru/join/AbC-d_e")
+
+    def test_link_extracted_from_surrounding_text(self):
+        # A link pasted inside a sentence is still actioned (trailing comma trimmed).
+        self.assertEqual(
+            MaxToTelegramBridge._smart_action("вступи: max.ru/join/XyZ, спасибо"),
+            "/join max.ru/join/XyZ")
+
+    def test_username_becomes_find(self):
+        self.assertEqual(
+            MaxToTelegramBridge._smart_action("@cool_channel"), "/find @cool_channel")
+
+    def test_phone_becomes_find(self):
+        self.assertEqual(
+            MaxToTelegramBridge._smart_action("+7 999 123-45-67"),
+            "/find +7 999 123-45-67")
+
+    def test_plain_text_is_ignored(self):
+        self.assertIsNone(MaxToTelegramBridge._smart_action("привет, как дела?"))
+
+    def test_empty_is_ignored(self):
+        self.assertIsNone(MaxToTelegramBridge._smart_action("   "))
+
+
 class TopicStateTests(unittest.TestCase):
     def test_state_roundtrip_and_find_by_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,6 +151,14 @@ class TopicStateTests(unittest.TestCase):
     def test_topic_title_is_normalized_and_limited(self):
         self.assertEqual(normalize_topic_title("  Людмила   Иванова  ", "fallback"), "Людмила Иванова")
         self.assertLessEqual(len(normalize_topic_title("x" * 200, "fallback")), 120)
+
+    def test_delete_topic_forgets_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = BridgeState(Path(tmp) / "state.json")
+            state.save_topic(555, thread_id=7, title="X", chat_type="dialog")
+            self.assertTrue(state.delete_topic(555))
+            self.assertIsNone(state.get_topic(555))
+            self.assertFalse(state.delete_topic(555))  # already gone
 
 
 class ConfigTests(unittest.TestCase):
@@ -307,6 +343,39 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
         with patch("bridge.tg.send_message", side_effect=lambda *a, **k: sent.append(a[2])):
             await bridge._handle_command(111, None, "/help")
         self.assertTrue(sent and "/join" in sent[0])
+
+    async def test_bare_link_in_chat_triggers_join_without_command(self):
+        # The simplification: a pasted link acts like /join — no command typed.
+        import maxactions
+        bridge = self.make_bridge()
+        bridge._client = object()
+        result = maxactions.CommandResult("✅ Вступил: Канал")
+        update = {"message": {"chat": {"id": 111}, "text": "https://max.ru/join/AbCdEf"}}
+        with patch("bridge.maxactions.join", new=AsyncMock(return_value=result)) as join, \
+                patch("bridge.tg.send_message", return_value=1):
+            await bridge._handle_update(update)
+        join.assert_awaited_once()
+        self.assertEqual(join.await_args.args[1], "https://max.ru/join/AbCdEf")
+
+    async def test_stale_topic_dropped_on_thread_not_found(self):
+        # A deleted Telegram thread -> bridge forgets the topic so it recreates,
+        # instead of dropping that chat's messages forever.
+        bridge = self.make_bridge()
+        bridge._own_id = 999
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(555, thread_id=42, title="X", chat_type="dialog")
+            bridge._client = object()
+            packet = {"opcode": 128, "payload": {
+                "chatId": 555,
+                "message": {"id": 1, "sender": 7, "text": "привет"},
+            }}
+            err = RuntimeError("Telegram API sendMessage failed: {'description': "
+                               "'Bad Request: message thread not found'}")
+            with patch.object(bridge, "_resolve_sender_name", new=AsyncMock(return_value="A")), \
+                    patch("bridge.tg.send_message", side_effect=err):
+                await bridge._on_packet(bridge._client, packet)
+            self.assertIsNone(bridge._state.get_topic(555))
 
     async def test_falls_back_when_topic_creation_fails(self):
         bridge = self.make_bridge()

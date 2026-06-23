@@ -7,6 +7,7 @@ message in Telegram, the reply text is sent back to the originating MAX chat.
 import asyncio
 import json
 import logging
+import re
 from collections import OrderedDict
 from pathlib import Path
 
@@ -40,14 +41,12 @@ ATTACH_DEBUG_LOG_MAX_BYTES = 5 * 1024 * 1024
 # Owner-only Telegram commands to drive MAX (join chats, find people, start DMs).
 _HELP_TEXT = (
     "🤖 Что я умею\n\n"
-    "📥 Присылаю сюда сообщения из MAX.\n"
-    "↩️ Чтобы написать в чат MAX — сделайте Reply (свайп) на пересланном сообщении.\n\n"
-    "Команды:\n"
-    "• /join <ссылка или @username> — вступить в канал / группу / чат MAX\n"
-    "• /find <+телефон | @ник | id | ссылка> — найти человека или канал\n"
-    "• /help — эта справка\n\n"
-    "💡 Новый диалог по id (/dm) пока в разработке — для существующих чатов "
-    "используйте Reply на пересланном сообщении."
+    "📥 Пересылаю сюда сообщения из MAX. Ответить — Reply (свайп) на пересланном.\n\n"
+    "➕ Вступить в чат/канал — просто пришлите ссылку (команда не нужна):\n"
+    "   https://max.ru/join/…\n\n"
+    "🔍 Найти человека/канал — пришлите телефон или @ник:\n"
+    "   +79991234567   ·   @nickname\n\n"
+    "⌨️ Можно и командами: /join <ссылка>, /find <телефон|@ник|id>, /help."
 )
 _WELCOME_TEXT = "👋 Привет! Я зеркалю ваш MAX в Telegram.\n\n" + _HELP_TEXT
 # Registered in Telegram's "/" menu so the commands are discoverable.
@@ -56,6 +55,11 @@ _BOT_COMMANDS = [
     {"command": "find", "description": "Найти человека/канал: телефон, @ник, id"},
     {"command": "help", "description": "Справка по командам"},
 ]
+
+# Bare-message shortcuts: send a link / phone / @username with no slash command.
+_SMART_MAX_LINK = re.compile(r"\S*max\.ru/\S+", re.IGNORECASE)
+_SMART_USERNAME = re.compile(r"@[A-Za-z0-9_.]{3,32}")
+_SMART_PHONE = re.compile(r"[+]?\d[\d\s()\-]{6,18}")
 
 # kind -> (tg function, supports_caption)
 _MEDIA_SENDERS = {
@@ -320,34 +324,46 @@ class MaxToTelegramBridge:
             if chat_id is None:
                 skipped += 1
                 continue
-            existing_topic = self._state.get_topic(chat_id)
-            if existing_topic:
-                existing += 1
-                thread_id = existing_topic.get("telegram_thread_id")
-                if thread_id:
-                    title, chat_type, sender = await self._sync_chat_meta(client, chat)
-                    await self._refresh_topic_title(
-                        chat_id, thread_id, title, chat_type, sender
-                    )
+            # One bad chat (e.g. a topic the user deleted in Telegram → "message
+            # thread not found") must not abort the whole preload and crash the
+            # session into a reconnect loop. Skip it and keep going.
+            try:
+                existing_topic = self._state.get_topic(chat_id)
+                if existing_topic:
+                    existing += 1
+                    thread_id = existing_topic.get("telegram_thread_id")
+                    if thread_id:
+                        title, chat_type, sender = await self._sync_chat_meta(client, chat)
+                        await self._refresh_topic_title(
+                            chat_id, thread_id, title, chat_type, sender
+                        )
+                        if await self._seed_last_message(
+                            client, chat_id, thread_id, chat.get("lastMessage")
+                        ):
+                            seeded += 1
+                    continue
+
+                title, chat_type, sender = await self._sync_chat_meta(client, chat)
+                _target_chat_id, thread_id, in_topic = await self._telegram_target(
+                    chat_id, title, chat_type, sender
+                )
+                if in_topic and thread_id:
+                    created += 1
                     if await self._seed_last_message(
                         client, chat_id, thread_id, chat.get("lastMessage")
                     ):
                         seeded += 1
-                continue
-
-            title, chat_type, sender = await self._sync_chat_meta(client, chat)
-            _target_chat_id, thread_id, in_topic = await self._telegram_target(
-                chat_id, title, chat_type, sender
-            )
-            if in_topic and thread_id:
-                created += 1
-                if await self._seed_last_message(
-                    client, chat_id, thread_id, chat.get("lastMessage")
-                ):
-                    seeded += 1
-            else:
+                else:
+                    failed += 1
+                await asyncio.sleep(0.35)
+            except Exception as exc:
                 failed += 1
-            await asyncio.sleep(0.35)
+                if "thread not found" in str(exc).lower():
+                    self._state.delete_topic(chat_id)
+                    _logger.warning("Preload: dropped stale topic for chat %s "
+                                    "(thread deleted); will recreate.", chat_id)
+                else:
+                    _logger.warning("Preload skipped chat %s: %s", chat_id, exc)
 
         _logger.info(
             "Topic preload finished: %s created, %s existing, %s seeded, %s failed, %s skipped.",
@@ -519,6 +535,7 @@ class MaxToTelegramBridge:
         if self._forward_sem is None:
             self._forward_sem = asyncio.Semaphore(MEDIA_CONCURRENCY)
         async with self._forward_sem:
+            chat_id = None
             try:
                 payload = packet.get("payload", {})
                 message = payload.get("message", {})
@@ -543,8 +560,15 @@ class MaxToTelegramBridge:
                                     chat_title, chat_type)
                 _logger.info("Forwarded from %s (chat %s, %d attach)",
                              sender, chat_id, len(parsed))
-            except Exception:
-                _logger.exception("Failed to handle packet: %s", packet)
+            except Exception as exc:
+                if "thread not found" in str(exc).lower() and chat_id is not None:
+                    # Topic was deleted in Telegram — forget it so the next message
+                    # from this chat recreates a fresh topic.
+                    self._state.delete_topic(chat_id)
+                    _logger.warning("Dropped stale topic for chat %s (Telegram "
+                                    "thread deleted); it will be recreated.", chat_id)
+                else:
+                    _logger.exception("Failed to handle packet: %s", packet)
 
     async def _forward(self, client, header, text, parsed,
                        chat_id, max_message_id, sender, chat_title, chat_type):
@@ -838,6 +862,23 @@ class MaxToTelegramBridge:
         except Exception as exc:
             _logger.warning("Could not register bot commands: %s", exc)
 
+    @staticmethod
+    def _smart_action(text: str) -> str | None:
+        """Turn a bare pasted message into a command, so the user can just send a
+        link / phone / @username instead of typing /join or /find. Returns the
+        synthetic command string, or None if nothing actionable matches."""
+        t = (text or "").strip()
+        if not t:
+            return None
+        link = _SMART_MAX_LINK.search(t)
+        if link:
+            return f"/join {link.group(0).rstrip('.,);')}"
+        if _SMART_USERNAME.fullmatch(t):
+            return f"/find {t}"
+        if _SMART_PHONE.fullmatch(t):
+            return f"/find {t}"
+        return None
+
     async def _handle_command(self, incoming_chat, thread_id, text: str) -> None:
         """Owner-only slash commands that drive MAX (join/find/dm). Caller already
         verified the message came from an allowed chat."""
@@ -908,9 +949,11 @@ class MaxToTelegramBridge:
         target = self._reply_map.get(reply.get("message_id")) if reply else None
         if target:
             await self._send_telegram_update_to_max(target, message)
-        elif self._forum_chat_id and str(incoming_chat) == str(self._forum_chat_id):
-            thread_id = message.get("message_thread_id")
-            topic = self._state.find_by_thread(thread_id) if thread_id else None
+            return
+        thread_id = message.get("message_thread_id")
+        in_forum = self._forum_chat_id and str(incoming_chat) == str(self._forum_chat_id)
+        if in_forum and thread_id:
+            topic = self._state.find_by_thread(thread_id)
             if topic:
                 await self._send_telegram_update_to_max({
                     "chat_id": topic["max_chat_id"],
@@ -919,11 +962,18 @@ class MaxToTelegramBridge:
                     "telegram_chat_id": self._forum_chat_id,
                     "message_thread_id": thread_id,
                 }, message)
-        else:
-            await asyncio.to_thread(
-                tg.send_message, self._token, incoming_chat,
-                "ℹ️ Чтобы ответить в MAX, сделайте «Ответить» (Reply / свайп) "
-                "на пересланном сообщении и напишите текст.")
+                return
+        # A loose message (not a reply, not inside a chat topic): a bare link /
+        # @username / phone acts like the matching command — no /join needed.
+        action = self._smart_action(text)
+        if action:
+            await self._handle_command(incoming_chat, thread_id, action)
+            return
+        await asyncio.to_thread(
+            tg.send_message, self._token, incoming_chat,
+            "ℹ️ Написать в чат MAX — Reply (свайп) на пересланном сообщении.\n"
+            "Вступить в чат/канал — просто пришлите ссылку.",
+            message_thread_id=thread_id)
 
     async def _poll_telegram(self) -> None:
         """Long-poll Telegram for replies; skip the backlog on startup."""

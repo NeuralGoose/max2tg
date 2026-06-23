@@ -113,6 +113,15 @@ class BridgeState:
                 return topic
         return None
 
+    def delete_topic(self, max_chat_id: int | str) -> bool:
+        """Forget a topic (e.g. its Telegram thread was deleted) so the next
+        message from that MAX chat recreates a fresh one. True if it existed."""
+        if str(max_chat_id) in self._data["topics"]:
+            del self._data["topics"][str(max_chat_id)]
+            self.save()
+            return True
+        return False
+
 
 def normalize_topic_title(value: str, fallback: str) -> str:
     title = " ".join((value or "").split()) or fallback
