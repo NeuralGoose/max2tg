@@ -44,15 +44,18 @@ _HELP_TEXT = (
     "📥 Пересылаю сюда сообщения из MAX. Ответить — Reply (свайп) на пересланном.\n\n"
     "➕ Вступить в чат/канал — просто пришлите ссылку (команда не нужна):\n"
     "   https://max.ru/join/…\n\n"
-    "🔍 Найти человека/канал — пришлите телефон или @ник:\n"
+    "🔍 Найти человека — пришлите телефон или @ник, получите его id:\n"
     "   +79991234567   ·   @nickname\n\n"
-    "⌨️ Можно и командами: /join <ссылка>, /find <телефон|@ник|id>, /help."
+    "✍️ Написать новому человеку — /dm <id> <текст> (id берётся из 🔍):\n"
+    "   /dm 21243808 привет\n\n"
+    "⌨️ Ещё: /join <ссылка>, /find <телефон|@ник|id>, /help."
 )
 _WELCOME_TEXT = "👋 Привет! Я зеркалю ваш MAX в Telegram.\n\n" + _HELP_TEXT
 # Registered in Telegram's "/" menu so the commands are discoverable.
 _BOT_COMMANDS = [
     {"command": "join", "description": "Вступить в канал/группу/чат MAX по ссылке"},
     {"command": "find", "description": "Найти человека/канал: телефон, @ник, id"},
+    {"command": "dm", "description": "Написать человеку: /dm <id из /find> <текст>"},
     {"command": "help", "description": "Справка по командам"},
 ]
 

@@ -11,18 +11,22 @@ Opcodes (vkmax / verified against PyMax MaxTeamAPI):
   46  find contact by phone (CONTACT_INFO_BY_PHONE) -> payload.contact
   32  resolve users by id (vkmax resolve_users)
 
+  64  send message: by chatId (existing chat) OR by userId (opens a 1:1 dialog)
+
+/dm by user_id works via opcode 64 with a top-level `userId` (instead of `chatId`):
+MAX has no separate "open dialog" call — the server lazily creates the 1:1 dialog
+and returns its real chatId. (Confirmed against the decompiled official client +
+tested protocol docs; the earlier failure was putting the user_id in the `chatId`
+slot, which addresses the wrong chat.)
+
 NOT wired:
 - Free-text name search (opcode 60 PUBLIC_SEARCH): payload schema unconfirmed; a
   bad payload makes MAX drop the socket (proto.payload), killing the live bridge.
-- /dm by user_id: a MAX dialog's chatId is NOT the peer's user_id (verified live:
-  resolve_users(dialogChatId) returns a different/unknown user). So send_message
-  to a user_id reaches the wrong chat (or not.found). Disabled until the
-  "open dialog by user_id" opcode is found. Replying to a *forwarded* message
-  still works — that path uses the real dialog chatId from the bridge's reply_map.
 """
 import logging
 import re
 from dataclasses import dataclass
+from random import randint
 
 from vkmax.functions.users import resolve_users
 
@@ -171,13 +175,36 @@ async def find(client, query: str) -> CommandResult:
 
 
 async def start_dm(client, user_id: str, text: str) -> CommandResult:
-    """DISABLED: a MAX dialog's chatId is not the peer user_id (verified live), so
-    sending by id could reach the wrong person. Sends nothing — returns only an
-    explanation — until the open-dialog-by-id opcode is found."""
-    return CommandResult(
-        "🚧 /dm пока отключён.\n"
-        "Выяснилось, что в MAX номер диалога не равен id пользователя, поэтому "
-        "отправка по id могла бы уйти не тому человеку — я это отключил ради "
-        "безопасности.\n\n"
-        "Чтобы написать в существующий чат MAX — ответьте (Reply/свайп) на его "
-        "пересланном сообщении: это идёт точно в нужный чат.")
+    """Message a person by their numeric user_id (the id from /find). Sends opcode
+    64 with a top-level `userId` (NOT `chatId`): MAX creates the 1:1 dialog and
+    returns its real chatId. The peer's reply then arrives as its own topic."""
+    try:
+        uid = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        return CommandResult(
+            "⚠️ Нужен числовой id (как из 🔍 /find). Пример: /dm 21243808 привет")
+    body = (text or "").strip()
+    if not body:
+        return CommandResult("⚠️ Пустое сообщение. Пример: /dm 21243808 привет")
+    if len(body) > 4000:
+        return CommandResult("⚠️ Слишком длинное сообщение (макс. 4000 символов).")
+    try:
+        data = await client.invoke_method(opcode=64, payload={
+            "userId": uid,
+            "message": {
+                "text": body,
+                "cid": randint(1750000000000, 2000000000000),
+                "elements": [],
+                "attaches": [],
+            },
+            "notify": True,
+        })
+        payload = data.get("payload", {}) if isinstance(data, dict) else {}
+        if payload.get("error"):
+            return CommandResult(f"⚠️ MAX не принял сообщение: {_short(payload.get('error'))}")
+        return CommandResult(
+            f"✅ Отправлено! Диалог с человеком (id {uid}) создан — его ответ "
+            "придёт отдельной темой, дальше переписывайтесь там.")
+    except Exception as exc:
+        _logger.warning("start_dm to %s failed: %s", user_id, exc)
+        return CommandResult(f"⚠️ Не удалось отправить: {_short(exc)}")

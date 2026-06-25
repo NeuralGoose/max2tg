@@ -104,13 +104,36 @@ class FindTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StartDmTests(unittest.IsolatedAsyncioTestCase):
-    async def test_dm_is_disabled_and_sends_nothing(self):
-        # /dm must NOT contact MAX: dialog chatId != user_id, so sending by id
-        # could reach the wrong person. It only returns an explanation.
+    async def test_sends_by_user_id_not_chat_id(self):
+        # Opens a 1:1 dialog by user_id: opcode 64 with `userId` (NOT `chatId`),
+        # which is what makes MAX create the dialog and return its real chatId.
+        client = AsyncMock(invoke_method=AsyncMock(
+            return_value={"payload": {"chatId": 7268926, "message": {"id": 1}}}))
+        res = await maxactions.start_dm(client, "21243808", "привет")
+        self.assertIn("Отправлено", res.text)
+        call = client.invoke_method.call_args.kwargs
+        self.assertEqual(call["opcode"], 64)
+        self.assertEqual(call["payload"]["userId"], 21243808)
+        self.assertNotIn("chatId", call["payload"])       # never in the chatId slot
+        self.assertEqual(call["payload"]["message"]["text"], "привет")
+
+    async def test_rejects_non_numeric_id(self):
         client = AsyncMock()
-        res = await maxactions.start_dm(client, "999", "привет")
-        self.assertIn("отключ", res.text.lower())
+        res = await maxactions.start_dm(client, "не-число", "привет")
+        self.assertIn("числовой id", res.text)
         client.invoke_method.assert_not_called()
+
+    async def test_rejects_empty_text(self):
+        client = AsyncMock()
+        res = await maxactions.start_dm(client, "5", "   ")
+        self.assertIn("Пустое", res.text)
+        client.invoke_method.assert_not_called()
+
+    async def test_surfaces_max_error(self):
+        client = AsyncMock(invoke_method=AsyncMock(
+            return_value={"payload": {"error": "user.not.found"}}))
+        res = await maxactions.start_dm(client, "5", "привет")
+        self.assertIn("не принял", res.text)
 
 
 if __name__ == "__main__":
