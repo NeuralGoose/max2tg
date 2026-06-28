@@ -1,34 +1,27 @@
-"""Telegram-command -> MAX actions: join chats/channels, find people. (/dm pending.)
+"""Telegram-command -> MAX actions: join chats/channels, find people, /dm.
 
-Thin wrappers over the vkmax / MAX opcodes with link parsing and defensive
-response handling, so the bridge can expose /join and /find from Telegram. Every
-public coroutine returns a CommandResult (never raises).
+Thin wrappers over PyMax's typed client methods with link parsing and defensive
+error handling, so the bridge can expose /join, /find and /dm from Telegram.
+Every public coroutine returns a CommandResult and never raises.
 
-Opcodes (vkmax / verified against PyMax MaxTeamAPI):
-  57  join/resolve by link (channels: https://max.ru/<name>; groups: join/<hash>)
-  89  resolve by link (read-only lookup)
-  75  subscribe to a chat
-  46  find contact by phone (CONTACT_INFO_BY_PHONE) -> payload.contact
-  32  resolve users by id (vkmax resolve_users)
+PyMax methods used (see Document 2 §4):
+  join_group(link)            group invite links (max.ru/join/<hash>)
+  join_channel(link)          channel/username links (max.ru/<name>)
+  resolve_group_by_link(link) read-only lookup of a group invite link
+  search_by_phone(phone)      find a contact by phone -> User
+  get_user(id)                resolve a user by numeric id -> User | None
+  get_chat_id(a, b)           deterministic 1:1 dialog id (XOR), no network
+  send_message(chat_id, text) send into that dialog
 
-  64  send message: by chatId (existing chat) OR by userId (opens a 1:1 dialog)
-
-/dm by user_id works via opcode 64 with a top-level `userId` (instead of `chatId`):
-MAX has no separate "open dialog" call — the server lazily creates the 1:1 dialog
-and returns its real chatId. (Confirmed against the decompiled official client +
-tested protocol docs; the earlier failure was putting the user_id in the `chatId`
-slot, which addresses the wrong chat.)
-
-NOT wired:
-- Free-text name search (opcode 60 PUBLIC_SEARCH): payload schema unconfirmed; a
-  bad payload makes MAX drop the socket (proto.payload), killing the live bridge.
+Notes:
+- Free-text name search (PUBLIC_SEARCH) stays unwired: the payload schema is
+  unconfirmed and a bad request drops the MAX socket.
+- /find by a channel/@username link is read-only-resolvable only for group
+  invite (join/) links in PyMax; for channels we point the user at /join.
 """
 import logging
 import re
 from dataclasses import dataclass
-from random import randint
-
-from vkmax.functions.users import resolve_users
 
 _logger = logging.getLogger(__name__)
 
@@ -41,6 +34,8 @@ class CommandResult:
     """A command's Telegram reply text. (No send target is carried: a user-id is
     NOT a dialog chatId in MAX, so it must never become a send destination.)"""
     text: str
+    outbound_chat_id: int | None = None
+    outbound_message_id: int | str | None = None
 
 
 def _short(value, limit: int = 200) -> str:
@@ -49,8 +44,8 @@ def _short(value, limit: int = 200) -> str:
 
 
 def _norm_link(raw: str) -> str | None:
-    """MAX link payload (opcode 57/89) from a raw string: a group invite
-    (join/<hash>), a max.ru/<name> link, or a bare @username."""
+    """MAX join link from a raw string: a group invite (join/<hash>), a
+    max.ru/<name> link, or a bare @username (-> https://max.ru/<name>)."""
     s = raw.strip()
     # Match a join hash only as a path segment (string start or after '/'), so a
     # query like 'max.ru/news?ref=join/x' isn't misread as a group invite.
@@ -66,24 +61,18 @@ def _norm_link(raw: str) -> str | None:
     return None
 
 
-def _display(contact: dict) -> str | None:
-    names = contact.get("names")
-    if isinstance(names, list):
-        for n in names:
-            if isinstance(n, dict):
-                full = f"{n.get('firstName', '')} {n.get('lastName', '')}".strip()
-                if full:
-                    return full
-                if n.get("name"):
-                    return str(n["name"]).strip()
-    return (contact.get("name") or "").strip() or None
-
-
-def _chat_from_payload(payload: dict):
-    chat = payload.get("chat") if isinstance(payload.get("chat"), dict) else payload
-    chat_id = chat.get("id") or chat.get("chatId")
-    title = (chat.get("title") or chat.get("name") or "").strip()
-    return chat_id, title
+def _user_display(user) -> str | None:
+    """Display name from a PyMax User.names (list[Name]); prefer first+last."""
+    for entry in getattr(user, "names", None) or []:
+        first = getattr(entry, "first_name", None) or ""
+        last = getattr(entry, "last_name", None) or ""
+        full = f"{first} {last}".strip()
+        if full:
+            return full
+        name = getattr(entry, "name", None)
+        if name:
+            return str(name).strip()
+    return None
 
 
 def _normalize_phone(s: str) -> str | None:
@@ -98,36 +87,32 @@ def _normalize_phone(s: str) -> str | None:
 
 
 async def join(client, raw: str) -> CommandResult:
-    """Join a MAX channel/group/chat by link or @username (opcode 57 + subscribe)."""
+    """Join a MAX channel/group by link or @username (PyMax join_group/channel)."""
     link = _norm_link(raw)
     if not link:
         return CommandResult(
             "🤔 Не похоже на ссылку. Пришлите ссылку вида max.ru/имя или @username.\n"
             "Пример: /join https://max.ru/join/AbCdEf")
     try:
-        data = await client.invoke_method(opcode=57, payload={"link": link})
-        payload = data.get("payload", {}) if isinstance(data, dict) else {}
-        if "error" in payload:
-            return CommandResult(f"⚠️ MAX не дал вступить: {_short(payload.get('error'))}")
-        chat_id, title = _chat_from_payload(payload)
-        if chat_id is not None:
-            try:
-                await client.invoke_method(
-                    opcode=75, payload={"chatId": chat_id, "subscribe": True})
-            except Exception as exc:
-                _logger.warning("subscribe after join %s: %s", chat_id, exc)
-        name = title or (f"чат {chat_id}" if chat_id else "чат")
-        return CommandResult(
-            f"✅ Готово, вы вступили: {name}\n"
-            "Чат появится отдельной темой, как только придёт первое сообщение.")
+        if link.startswith("join/"):
+            chat = await client.join_group(link)
+        else:
+            chat = await client.join_channel(link)
     except Exception as exc:
         _logger.warning("join failed: %s", exc)
         return CommandResult(f"⚠️ Не удалось вступить: {_short(exc)}")
+    title = (getattr(chat, "title", None) or "").strip()
+    chat_id = getattr(chat, "id", None)
+    name = title or (f"чат {chat_id}" if chat_id else "чат")
+    return CommandResult(
+        f"✅ Готово, вы вступили: {name}\n"
+        "Чат появится отдельной темой, как только придёт первое сообщение.")
 
 
 async def find(client, query: str) -> CommandResult:
-    """Find a person by phone (46) or id (32), or a channel/person by @username/
-    link (89). Free-text name search isn't available."""
+    """Find a person by phone (search_by_phone) or numeric id (get_user), or a
+    group by invite link (resolve_group_by_link). Free-text name search isn't
+    available; channel/@username links are pointed to /join."""
     s = query.strip()
     if len(s) > _MAX_QUERY_LEN:
         return CommandResult("⚠️ Слишком длинный запрос для поиска.")
@@ -140,44 +125,46 @@ async def find(client, query: str) -> CommandResult:
         if not phone:
             return CommandResult("🔍 Похоже на телефон, но номер неполный. Пример: +79991234567")
         try:
-            data = await client.invoke_method(opcode=46, payload={"phone": phone})
-            payload = data.get("payload", {}) if isinstance(data, dict) else {}
-            contact = payload.get("contact")
-            if payload.get("error") or not isinstance(contact, dict):
-                return CommandResult(f"🔍 По номеру {phone} никто не найден.")
-            return CommandResult(
-                f"🔍 Нашёл: {_display(contact) or contact.get('id')}\n🆔 id: {contact.get('id')}")
+            user = await client.search_by_phone(phone)
         except Exception as exc:
-            return CommandResult(f"⚠️ Ошибка поиска по телефону: {_short(exc)}")
+            _logger.info("phone search %s: %s", phone, exc)
+            return CommandResult(f"🔍 По номеру {phone} никто не найден.")
+        if not user:
+            return CommandResult(f"🔍 По номеру {phone} никто не найден.")
+        return CommandResult(
+            f"🔍 Нашёл: {_user_display(user) or user.id}\n🆔 id: {user.id}")
     if s.lstrip("-").isdigit():
         try:
-            data = await resolve_users(client, [int(s)])
-            contacts = data.get("payload", {}).get("contacts", []) if isinstance(data, dict) else []
-            if not contacts:
-                return CommandResult(f"🔍 Человек с id {s} не найден.")
-            return CommandResult(f"🔍 Нашёл: {_display(contacts[0]) or s}\n🆔 id: {s}")
+            user = await client.get_user(int(s))
         except Exception as exc:
             return CommandResult(f"⚠️ Ошибка поиска: {_short(exc)}")
+        if not user:
+            return CommandResult(f"🔍 Человек с id {s} не найден.")
+        return CommandResult(f"🔍 Нашёл: {_user_display(user) or s}\n🆔 id: {s}")
     link = _norm_link(s)
     if not link:
         return CommandResult(
             "🔍 Поиск по названию (свободный текст) MAX через бота пока недоступен.\n"
             "Ищите по: телефону (+7…), @нику, ссылке max.ru/… или числовому id.")
+    if not link.startswith("join/"):
+        # PyMax's read-only resolve only accepts group invite (join/) links.
+        return CommandResult(
+            f"🔍 Канал/пользователя по ссылке смотрите через вступление: /join {s}")
     try:
-        data = await client.invoke_method(opcode=89, payload={"link": link})
-        payload = data.get("payload", {}) if isinstance(data, dict) else {}
-        chat_id, title = _chat_from_payload(payload)
-        if chat_id is None:
-            return CommandResult(f"🔍 Ничего не найдено по «{s}».")
-        return CommandResult(f"🔍 Нашёл: {title or s}\n🆔 id: {chat_id}\nВступить: /join {s}")
+        chat = await client.resolve_group_by_link(link)
     except Exception as exc:
         return CommandResult(f"⚠️ Ошибка поиска: {_short(exc)}")
+    if chat is None:
+        return CommandResult(f"🔍 Ничего не найдено по «{s}».")
+    title = (getattr(chat, "title", None) or "").strip()
+    chat_id = getattr(chat, "id", None)
+    return CommandResult(f"🔍 Нашёл: {title or s}\n🆔 id: {chat_id}\nВступить: /join {s}")
 
 
 async def start_dm(client, user_id: str, text: str) -> CommandResult:
-    """Message a person by their numeric user_id (the id from /find). Sends opcode
-    64 with a top-level `userId` (NOT `chatId`): MAX creates the 1:1 dialog and
-    returns its real chatId. The peer's reply then arrives as its own topic."""
+    """Message a person by their numeric user_id (the id from /find). Computes the
+    1:1 dialog id via PyMax get_chat_id(my_id, uid) and sends into it; the peer's
+    reply then arrives as its own topic."""
     try:
         uid = int(str(user_id).strip())
     except (TypeError, ValueError):
@@ -188,23 +175,19 @@ async def start_dm(client, user_id: str, text: str) -> CommandResult:
         return CommandResult("⚠️ Пустое сообщение. Пример: /dm 21243808 привет")
     if len(body) > 4000:
         return CommandResult("⚠️ Слишком длинное сообщение (макс. 4000 символов).")
+    my_id = getattr(getattr(getattr(client, "me", None), "contact", None), "id", None)
+    if my_id is None:
+        return CommandResult("⏳ MAX ещё подключается — попробуйте через минуту.")
     try:
-        data = await client.invoke_method(opcode=64, payload={
-            "userId": uid,
-            "message": {
-                "text": body,
-                "cid": randint(1750000000000, 2000000000000),
-                "elements": [],
-                "attaches": [],
-            },
-            "notify": True,
-        })
-        payload = data.get("payload", {}) if isinstance(data, dict) else {}
-        if payload.get("error"):
-            return CommandResult(f"⚠️ MAX не принял сообщение: {_short(payload.get('error'))}")
-        return CommandResult(
-            f"✅ Отправлено! Диалог с человеком (id {uid}) создан — его ответ "
-            "придёт отдельной темой, дальше переписывайтесь там.")
+        chat_id = client.get_chat_id(my_id, uid)
+        sent = await client.send_message(chat_id, body)
     except Exception as exc:
         _logger.warning("start_dm to %s failed: %s", user_id, exc)
         return CommandResult(f"⚠️ Не удалось отправить: {_short(exc)}")
+    outbound_id = getattr(sent, "id", None) if sent is not None else None
+    return CommandResult(
+        f"✅ Отправлено! Диалог с человеком (id {uid}) создан — его ответ "
+        "придёт отдельной темой, дальше переписывайтесь там.",
+        outbound_chat_id=chat_id if outbound_id is not None else None,
+        outbound_message_id=outbound_id,
+    )

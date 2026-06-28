@@ -11,7 +11,7 @@
 # To build from local source instead, use docker-compose.build.yml.
 services:
   max2tg:
-    image: ghcr.io/sillkiin/max2tg:latest
+    image: ghcr.io/neuralgoose/max2tg:latest
     container_name: max2tg
     restart: unless-stopped
     env_file: .env

@@ -4,6 +4,9 @@ __pycache__/
 *.log
 config.json
 state.json
+data/
 .env
 _*.py
 _*.txt
+docs/
+scripts/

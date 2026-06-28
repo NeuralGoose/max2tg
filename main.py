@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from bridge import MaxToTelegramBridge
-from config import apply_dotenv, load_config
+from config import apply_dotenv, load_config, missing_env_var_names
 from setup_wizard import run_setup
 
 LOG_PATH = Path(__file__).parent / "bridge.log"
@@ -72,8 +72,9 @@ def _configure() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[handler],
     )
-    # vkmax logs every packet at INFO, including auth tokens - keep it quieter
-    logging.getLogger("vkmax").setLevel(logging.WARNING)
+    # PyMax can log verbose protocol detail at INFO/DEBUG - keep it quieter so
+    # auth/session detail doesn't flood (and potentially leak into) bridge.log.
+    logging.getLogger("pymax").setLevel(logging.WARNING)
     _restrict_log_perms()
 
 
@@ -85,10 +86,10 @@ def main() -> None:
         # No config: the setup wizard needs an interactive console + browser.
         # On a server (no TTY) fail loudly instead of hanging on input().
         if not sys.stdin or not sys.stdin.isatty():
+            missing = ", ".join(missing_env_var_names()) or "см. DEPLOY.md"
             print("Конфигурация не найдена. На сервере задайте переменные "
-                  "окружения MAX2TG_TELEGRAM_BOT_TOKEN, MAX2TG_TELEGRAM_CHAT_ID, "
-                  "MAX2TG_MAX_TOKEN, либо положите рядом готовый config.json "
-                  "(см. DEPLOY.md).", file=sys.stderr)
+                  f"окружения {missing}, либо положите рядом готовый "
+                  "config.json (см. DEPLOY.md).", file=sys.stderr)
             raise SystemExit(1)
         print("Конфигурация не найдена - запускаю мастер настройки.")
         config = run_setup()

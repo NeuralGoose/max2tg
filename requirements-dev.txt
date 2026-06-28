@@ -1,0 +1,4 @@
+# Test/dev dependencies (installed into the Docker test image only).
+# Runtime deps live in requirements.txt.
+pytest>=8.0
+pytest-asyncio>=0.24

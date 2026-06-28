@@ -3,11 +3,20 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from bridge import MaxToTelegramBridge, _contact_display_name
+from types import SimpleNamespace
+
+from bridge import MaxToTelegramBridge
 from config import normalize_config
 from state import BridgeState, normalize_topic_title
+
+
+def _user(*names):
+    """Duck-typed PyMax User with a names list of (first, last) tuples."""
+    name_objs = [SimpleNamespace(first_name=f, last_name=last, name=None)
+                 for f, last in names]
+    return SimpleNamespace(names=name_objs)
 
 
 class DotenvTests(unittest.TestCase):
@@ -67,20 +76,17 @@ class StateSaveTests(unittest.TestCase):
             self.assertEqual(data["topics"]["123"]["telegram_thread_id"], 7)
 
 
-class ContactNameTests(unittest.TestCase):
+class DisplayNameTests(unittest.TestCase):
     def test_prefers_full_name_over_first_name_only(self):
-        contact = {
-            "names": [{"name": "Алина", "firstName": "Алина", "lastName": "Чернова"}],
-        }
-        self.assertEqual(_contact_display_name(contact), "Алина Чернова")
+        user = _user(("Алина", "Чернова"))
+        self.assertEqual(MaxToTelegramBridge._display_name(user), "Алина Чернова")
 
     def test_single_name_when_no_last_name(self):
-        contact = {"names": [{"name": "Кирилл", "firstName": "Кирилл"}]}
-        self.assertEqual(_contact_display_name(contact), "Кирилл")
+        user = _user(("Кирилл", None))
+        self.assertEqual(MaxToTelegramBridge._display_name(user), "Кирилл")
 
-    def test_falls_back_to_contact_level_fields(self):
-        contact = {"firstName": "Инна", "lastName": "Кладова"}
-        self.assertEqual(_contact_display_name(contact), "Инна Кладова")
+    def test_returns_none_without_names(self):
+        self.assertIsNone(MaxToTelegramBridge._display_name(_user()))
 
 
 class TopicBodyTests(unittest.TestCase):
@@ -101,6 +107,15 @@ class TopicBodyTests(unittest.TestCase):
         self.assertEqual(
             MaxToTelegramBridge._topic_caption("Иван", "Фото", is_channel=False),
             "Иван:\nФото")
+
+    def test_delivery_body_channel_omits_sender_prefix(self):
+        body = MaxToTelegramBridge._delivery_body(
+            "Коммерсантъ", "Новость", [], is_channel=True,
+            attribution="↪ Источник", in_topic=True, header="",
+        )
+        self.assertNotIn("Коммерсантъ:", body)
+        self.assertIn("Новость", body)
+        self.assertIn("↪", body)
 
 
 class SmartActionTests(unittest.TestCase):
@@ -177,6 +192,9 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config["telegram_preload_topics"])
         self.assertFalse(config["telegram_seed_last_messages"])
         self.assertEqual(config["telegram_preload_chat_count"], 100)
+        self.assertEqual(config["telegram_preload_chat_source"], "login")
+        self.assertEqual(config["telegram_preload_message_depth"], 1)
+        self.assertEqual(config["telegram_preload_fetch_pages"], 20)
 
     def test_env_overrides_apply_over_config_json(self):
         import os
@@ -284,6 +302,33 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(in_topic)
             self.assertEqual(bridge._state.get_topic(555)["title"], "Людмила")
 
+    async def test_create_topic_sets_icon_params(self):
+        bridge = self.make_bridge()
+        bridge._forum_icon_sticker_ids_cache = ["emoji_a", "emoji_b"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            with patch("bridge.tg.create_forum_topic", return_value=42) as create:
+                await bridge._telegram_target(555, "Test", "dialog", "Test")
+            create.assert_called_once()
+            kwargs = create.call_args.kwargs
+            self.assertIn("icon_color", kwargs)
+            self.assertEqual(kwargs["icon_custom_emoji_id"], "emoji_b")
+            self.assertTrue(bridge._state.get_topic(555).get("topic_icon_set"))
+
+    async def test_refresh_topic_icon_backfills_once(self):
+        bridge = self.make_bridge()
+        bridge._forum_icon_sticker_ids_cache = ["emoji_a"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._state.save_topic(100, thread_id=41, title="T", chat_type="chat")
+            with patch("bridge.tg.edit_forum_topic") as edit:
+                first = await bridge._refresh_topic_icon(100, 41)
+                second = await bridge._refresh_topic_icon(100, 41)
+            self.assertTrue(first)
+            self.assertFalse(second)
+            edit.assert_called_once()
+            self.assertTrue(bridge._state.get_topic(100).get("topic_icon_set"))
+
     async def test_concurrent_new_chat_creates_one_topic(self):
         # HIGH-fix: two concurrent packets from the same brand-new chat must
         # create exactly ONE Telegram topic, not duplicate it.
@@ -292,13 +337,17 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
             bridge._state = BridgeState(Path(tmp) / "state.json")
             created = []
 
-            async def slow_create(func, *args):
+            async def slow_create(func, *args, **kwargs):
                 # asyncio.to_thread passes the target callable first; yield so
                 # the second coroutine reaches the lock while we're "creating"
-                # (under the bug both would create a topic).
+                # (under the bug both would create a topic). Only count the
+                # createForumTopic call (the path also offloads the icon-sticker
+                # fetch to a thread, which is not a topic creation).
                 await asyncio.sleep(0)
-                created.append(args)
-                return 100 + len(created)
+                if getattr(func, "__name__", "") == "create_forum_topic":
+                    created.append((args, kwargs))
+                    return 100 + len(created)
+                return []
 
             with patch("bridge.asyncio.to_thread", side_effect=slow_create):
                 results = await asyncio.gather(
@@ -311,19 +360,12 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_name_cache_is_bounded(self):
         bridge = self.make_bridge()
-        with patch("bridge.NAME_CACHE_LIMIT", 3), \
-                patch("bridge.resolve_users", new=AsyncMock(return_value={})):
+        client = Mock()
+        client.get_user = AsyncMock(return_value=None)
+        with patch("bridge.NAME_CACHE_LIMIT", 3):
             for i in range(6):
-                await bridge._resolve_sender_name(object(), 1000 + i)
+                await bridge._resolve_sender_name(client, 1000 + i)
         self.assertLessEqual(len(bridge._name_cache), 3)
-
-    async def test_on_packet_ignores_non_dict_frame(self):
-        bridge = self.make_bridge()
-        client = object()
-        bridge._client = client
-        # A valid-JSON but non-dict frame must be ignored cleanly, not raise
-        # AttributeError out of the fire-and-forget handler task.
-        await bridge._on_packet(client, [1, 2, 3])  # must not raise
 
     async def test_find_command_does_not_remember_dm_target(self):
         # /find must NOT create a reply_map send-target from a user-supplied id
@@ -357,26 +399,6 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
         join.assert_awaited_once()
         self.assertEqual(join.await_args.args[1], "https://max.ru/join/AbCdEf")
 
-    async def test_stale_topic_dropped_on_thread_not_found(self):
-        # A deleted Telegram thread -> bridge forgets the topic so it recreates,
-        # instead of dropping that chat's messages forever.
-        bridge = self.make_bridge()
-        bridge._own_id = 999
-        with tempfile.TemporaryDirectory() as tmp:
-            bridge._state = BridgeState(Path(tmp) / "state.json")
-            bridge._state.save_topic(555, thread_id=42, title="X", chat_type="dialog")
-            bridge._client = object()
-            packet = {"opcode": 128, "payload": {
-                "chatId": 555,
-                "message": {"id": 1, "sender": 7, "text": "привет"},
-            }}
-            err = RuntimeError("Telegram API sendMessage failed: {'description': "
-                               "'Bad Request: message thread not found'}")
-            with patch.object(bridge, "_resolve_sender_name", new=AsyncMock(return_value="A")), \
-                    patch("bridge.tg.send_message", side_effect=err):
-                await bridge._on_packet(bridge._client, packet)
-            self.assertIsNone(bridge._state.get_topic(555))
-
     async def test_falls_back_when_topic_creation_fails(self):
         bridge = self.make_bridge()
         with tempfile.TemporaryDirectory() as tmp:
@@ -390,6 +412,36 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(thread_id)
             self.assertFalse(in_topic)
 
+    async def test_fallback_forward_includes_header_and_reply_map(self):
+        bridge = self.make_bridge()
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge._state = BridgeState(Path(tmp) / "state.json")
+            bridge._own_id = 999
+            client = Mock()
+            client.get_user = AsyncMock(return_value=_user(("Иван", "Петров")))
+            client.get_chat = AsyncMock(return_value=SimpleNamespace(
+                title="Семья", type="CHAT",
+            ))
+            bridge._client = client
+            message = SimpleNamespace(
+                id=1, chat_id=555, sender=7, text="привет",
+                attaches=[], model_extra={}, stats=None,
+            )
+            with patch("bridge.tg.create_forum_topic",
+                       side_effect=RuntimeError("no rights")), \
+                    patch("bridge.tg.send_message", return_value=10) as send:
+                await bridge._on_message(message, client)
+
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[1], 111)
+            body = send.call_args.args[2]
+            self.assertIn("MAX |", body)
+            self.assertIn("(чат 555)", body)
+            self.assertIn("привет", body)
+            self.assertIsNone(send.call_args.kwargs.get("message_thread_id"))
+            self.assertIn(10, bridge._reply_map)
+            self.assertEqual(bridge._reply_map[10]["chat_id"], 555)
+
     async def test_text_inside_topic_routes_to_max_chat(self):
         bridge = self.make_bridge()
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,7 +453,8 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                 chat_type="dialog",
                 sender="Людмила",
             )
-            bridge._client = object()
+            bridge._client = Mock()
+            bridge._client.send_message = AsyncMock()
             update = {
                 "message": {
                     "chat": {"id": -100222},
@@ -410,11 +463,11 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                 }
             }
 
-            with patch("bridge.max_send", new=AsyncMock()) as max_send, \
-                    patch("bridge.tg.send_message", return_value=10):
+            with patch("bridge.tg.send_message", return_value=10):
                 await bridge._handle_update(update)
 
-            max_send.assert_awaited_once_with(bridge._client, 555, "Привет из Telegram")
+            bridge._client.send_message.assert_awaited_once_with(
+                555, "Привет из Telegram", reply_to=None)
 
     async def test_media_inside_topic_uploads_file_to_max_chat(self):
         bridge = self.make_bridge()
@@ -472,24 +525,29 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(video["filename"], "telegram-sticker-u3.webm")
         self.assertEqual(video["mime_type"], "video/webm")
 
-    async def test_preload_topics_from_login_creates_missing_topics(self):
+    async def test_preload_topics_creates_missing_topics(self):
         bridge = self.make_bridge()
         bridge._config["telegram_preload_topics"] = True
         bridge._config["telegram_preload_chat_count"] = 10
-        login_response = {
-            "payload": {
-                "chats": [
-                    {"id": 100, "type": "CHAT", "title": "Family"},
-                    {"id": 200, "cid": 200, "type": "DIALOG"},
-                ]
-            }
-        }
+        bridge._config["telegram_preload_chat_delay_seconds"] = 0
+        bridge._own_id = 999
+        # PyMax client.chats: typed Chat objects (duck-typed here). The dialog
+        # resolves its title from the peer participant's display name.
+        client = Mock()
+        client.chats = [
+            SimpleNamespace(id=100, type="CHAT", title="Family",
+                            participants={}, last_message=None, cid=None),
+            SimpleNamespace(id=200, type="DIALOG", title=None,
+                            participants={999: 1, 777: 1}, last_message=None,
+                            cid=200),
+        ]
 
         with tempfile.TemporaryDirectory() as tmp:
             bridge._state = BridgeState(Path(tmp) / "state.json")
             with patch("bridge.tg.create_forum_topic", side_effect=[41, 42]), \
-                    patch.object(bridge, "_resolve_sender_name", new=AsyncMock(return_value="Alice")):
-                await bridge._preload_topics_from_login(object(), login_response)
+                    patch.object(bridge, "_resolve_sender_name",
+                                 new=AsyncMock(return_value="Alice")):
+                await bridge._preload_topics(client)
 
             self.assertEqual(bridge._state.get_topic(100)["telegram_thread_id"], 41)
             self.assertEqual(bridge._state.get_topic(100)["title"], "Family")
@@ -499,15 +557,17 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
     async def test_preload_topics_skips_existing_topic(self):
         bridge = self.make_bridge()
         bridge._config["telegram_preload_topics"] = True
-        login_response = {
-            "payload": {"chats": [{"id": 100, "type": "CHAT", "title": "Family"}]}
-        }
+        bridge._config["telegram_preload_chat_delay_seconds"] = 0
+        client = Mock()
+        client.chats = [SimpleNamespace(id=100, type="CHAT", title="Family",
+                                        participants={}, last_message=None,
+                                        cid=None)]
 
         with tempfile.TemporaryDirectory() as tmp:
             bridge._state = BridgeState(Path(tmp) / "state.json")
             bridge._state.save_topic(100, thread_id=41, title="Family", chat_type="chat")
             with patch("bridge.tg.create_forum_topic") as create_topic:
-                await bridge._preload_topics_from_login(object(), login_response)
+                await bridge._preload_topics(client)
 
             create_topic.assert_not_called()
 
@@ -515,14 +575,14 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
         bridge = self.make_bridge()
         bridge._config["telegram_seed_last_messages"] = True
         bridge._own_id = 999
-        message = {"id": "m1", "sender": 999, "text": "Last text"}
+        message = SimpleNamespace(id="m1", sender=999, text="Last text", attaches=[])
 
         with tempfile.TemporaryDirectory() as tmp:
             bridge._state = BridgeState(Path(tmp) / "state.json")
             bridge._state.save_topic(100, thread_id=41, title="Family", chat_type="chat")
             with patch("bridge.tg.send_message", return_value=555) as send_message:
-                first = await bridge._seed_last_message(object(), 100, 41, message)
-                second = await bridge._seed_last_message(object(), 100, 41, message)
+                first = await bridge._seed_last_message(Mock(), 100, 41, message)
+                second = await bridge._seed_last_message(Mock(), 100, 41, message)
 
             self.assertTrue(first)
             self.assertFalse(second)
@@ -534,25 +594,48 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
     async def test_seed_last_message_with_media_without_text(self):
         bridge = self.make_bridge()
         bridge._config["telegram_seed_last_messages"] = True
-        message = {
-            "id": "m2",
-            "sender": 123,
-            "text": "",
-            "attaches": [{"_type": "STICKER", "url": "https://example.com/sticker.webp"}],
-        }
+        sticker = SimpleNamespace(type="STICKER",
+                                  url="https://example.com/sticker.webp",
+                                  lottie_url=None)
+        message = SimpleNamespace(id="m2", sender=123, text="", attaches=[sticker])
 
         with tempfile.TemporaryDirectory() as tmp:
             bridge._state = BridgeState(Path(tmp) / "state.json")
             bridge._state.save_topic(100, thread_id=41, title="Family", chat_type="chat")
             with patch.object(bridge, "_resolve_sender_name", new=AsyncMock(return_value="Alice")), \
-                    patch.object(bridge, "_send_media_item", new=AsyncMock(return_value=True)) as send_media:
-                seeded = await bridge._seed_last_message(object(), 100, 41, message)
+                    patch.object(bridge, "_send_media_item", new=AsyncMock(return_value=(True, 10, True))) as send_media:
+                seeded = await bridge._seed_last_message(Mock(), 100, 41, message)
 
             self.assertTrue(seeded)
             send_media.assert_awaited_once()
             self.assertEqual(
                 bridge._state.get_topic(100)["last_seeded_max_message_id"], "m2"
             )
+
+
+class DeliveryStateTests(unittest.TestCase):
+    def test_mark_delivered_and_is_delivered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = BridgeState(Path(tmp) / "state.json")
+            state.save_topic(100, thread_id=41, title="Family", chat_type="chat")
+            self.assertFalse(state.is_delivered(100, "m1"))
+            state.mark_delivered(100, "m1")
+            self.assertTrue(state.is_delivered(100, "m1"))
+            topic = state.get_topic(100)
+            self.assertIn("m1", topic["delivered_max_message_ids"])
+            self.assertEqual(topic["last_delivered_max_message_id"], "m1")
+
+    def test_delivered_ids_are_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = BridgeState(Path(tmp) / "state.json")
+            state.save_topic(100, thread_id=41, title="Family", chat_type="chat")
+            from state import DELIVERED_IDS_LIMIT
+            for i in range(DELIVERED_IDS_LIMIT + 10):
+                state.mark_delivered(100, f"id-{i}")
+            ids = state.get_topic(100)["delivered_max_message_ids"]
+            self.assertEqual(len(ids), DELIVERED_IDS_LIMIT)
+            self.assertEqual(ids[0], "id-10")
+            self.assertEqual(ids[-1], f"id-{DELIVERED_IDS_LIMIT + 9}")
 
 
 class RedactionTests(unittest.TestCase):
@@ -570,55 +653,6 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("AAEsecretTokenValue1234567", out)
         self.assertNotIn("ABCDEFsecret123", out)
         self.assertIn("bot<redacted>", out)
-
-
-class MaxClientPendingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fail_pending_unblocks_awaiters(self):
-        import asyncio
-
-        import max_client
-        client = max_client.BrowserMaxClient()
-        fut = asyncio.get_event_loop().create_future()
-        client._pending = {1: fut}
-        client._fail_pending()
-        self.assertTrue(fut.done())
-        with self.assertRaises(ConnectionError):
-            fut.result()
-        self.assertEqual(client._pending, {})
-
-    async def test_recv_loop_skips_bad_frames(self):
-        import max_client
-
-        class FakeConn:
-            def __init__(self, frames):
-                self._frames = frames
-
-            def __aiter__(self):
-                return self._agen()
-
-            async def _agen(self):
-                for frame in self._frames:
-                    yield frame
-
-        client = max_client.BrowserMaxClient()
-        dispatched = []
-
-        async def callback(_c, packet):
-            dispatched.append(packet)
-
-        client._incoming_event_callback = callback
-        client._connection = FakeConn([
-            "not json at all",                       # unparseable -> skipped
-            "[1, 2, 3]",                             # valid JSON, non-dict -> skipped
-            "42",                                    # valid JSON scalar -> skipped
-            '{"opcode": 128, "payload": {"x": 1}}',  # valid event (no seq)
-        ])
-        await client._recv_loop()
-        await asyncio.sleep(0.01)  # let the dispatched task run
-        # Only the dict event is dispatched; non-dict frames never reach a
-        # callback that assumes a dict (would otherwise AttributeError).
-        self.assertEqual(len(dispatched), 1)
-        self.assertEqual(dispatched[0]["opcode"], 128)
 
 
 if __name__ == "__main__":

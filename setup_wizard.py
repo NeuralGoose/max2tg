@@ -1,15 +1,19 @@
 """Interactive first-run setup: Telegram bot token, chat id, MAX account login."""
 import asyncio
+import contextlib
 import logging
+import tempfile
 import time
 
 import tg
 from config import load_partial, save_config
-from max_client import BrowserMaxClient, MaxAuthError
+from max_client import MaxAuthError
 
 _logger = logging.getLogger(__name__)
 
 CHAT_ID_POLL_SECONDS = 120
+# How long to wait for the token login to populate the profile.
+VALIDATE_TIMEOUT = 60
 
 
 def _ask(prompt: str) -> str:
@@ -81,22 +85,61 @@ MAX_LOGIN_INSTRUCTIONS = f"""=== Шаг 3. Вход в ваш аккаунт MAX
 """
 
 
+def _profile_name(me) -> str | None:
+    contact = getattr(me, "contact", None)
+    names = getattr(contact, "names", None) or []
+    if names:
+        entry = names[0]
+        return (getattr(entry, "name", None)
+                or getattr(entry, "first_name", None))
+    return None
+
+
 async def _validate_token(token: str) -> str:
-    """Log in with the token to confirm it works; return it on success."""
-    client = BrowserMaxClient()
-    await client.connect()
+    """Log in with the token via PyMax to confirm it works; return it.
+
+    Runs a throwaway WebClient (temp session, reconnect off) as a task and waits
+    for its on_start to capture the profile, then cancels the task. We must not
+    call ``stop()`` from inside on_start: that cancels the recv task that
+    ``start()`` is awaiting in ``wait_closed()`` and surfaces as a (BaseException)
+    CancelledError out of ``start()``. An invalid token never fires on_start, so
+    ``me`` stays None.
+    """
+    from pymax import ExtraConfig, WebClient
+
+    captured: dict = {}
+    started = asyncio.Event()
+    work_dir = tempfile.mkdtemp(prefix="max2tg-validate-")
+    client = WebClient(
+        session_name="validate.db",
+        work_dir=work_dir,
+        extra_config=ExtraConfig(token=token, reconnect=False),
+    )
+
+    @client.on_start()
+    async def _capture(c):  # noqa: ANN001 - PyMax callback signature
+        captured["me"] = c.me
+        started.set()
+
+    run = asyncio.create_task(client.start())
+    waiter = asyncio.create_task(started.wait())
     try:
-        response = await client.login_by_token(token)
-        payload = response.get("payload", {})
-        if "error" in payload:
-            raise MaxAuthError(str(payload["error"]))
-        profile = payload.get("profile", {})
-        contact = profile.get("contact", {})
-        name = contact.get("names", [{}])[0].get("name") if contact else None
-        print(f"OK: вход выполнен ({name or profile.get('phone', 'аккаунт')}).")
-        return token
+        # Resolve as soon as either login succeeds (on_start → started) or the
+        # client gives up (run finishes, e.g. a rejected token).
+        await asyncio.wait({run, waiter}, timeout=VALIDATE_TIMEOUT,
+                           return_when=asyncio.FIRST_COMPLETED)
     finally:
-        await client.disconnect()
+        for task in (waiter, run):
+            task.cancel()
+        for task in (waiter, run):
+            with contextlib.suppress(BaseException):
+                await task
+
+    me = captured.get("me")
+    if me is None:
+        raise MaxAuthError("MAX не принял токен")
+    print(f"OK: вход выполнен ({_profile_name(me) or 'аккаунт'}).")
+    return token
 
 
 async def _setup_max_login() -> str:

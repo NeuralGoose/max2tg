@@ -1,9 +1,17 @@
 """Parse MAX message attachments into a normalized form for forwarding.
 
-MAX attach types (from the web client): PHOTO, VIDEO, STICKER, FILE, AUDIO,
-SHARE, CONTACT, LOCATION, CONTROL/WIDGET. Photos/stickers/audio usually carry
-a direct CDN URL; files/videos carry only ids/tokens, so we forward them as a
-described notification (with any embedded preview).
+PyMax delivers attachments as typed Pydantic models on ``Message.attaches``
+(PhotoAttachment, VideoAttachment, FileAttachment, StickerAttachment,
+AudioAttachment, ShareAttachment, ContactAttachment, CallAttachment, and
+UnknownAttachment for anything else). ``parse()`` turns those into the flat
+``ParsedAttach`` items the bridge forwards to Telegram.
+
+Photos/stickers/audio usually carry a direct CDN URL. Videos and files never
+ship a ready URL, so they are emitted as ``video_resolve`` / ``file_resolve``
+items the bridge resolves later via ``get_video_by_id`` / ``get_file_by_id``.
+
+The parser is intentionally duck-typed (dispatch on ``.type``, read fields via
+``getattr``) so it neither imports pymax nor breaks if a model field is missing.
 """
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -16,7 +24,7 @@ class ParsedAttach:
     text: str            # human-readable description (caption / fallback)
     url: str | None = None
     filename: str | None = None
-    file_id: int | str | None = None   # for file_resolve (WS resolve to a URL)
+    file_id: int | str | None = None   # for file_resolve (resolve to a URL)
     video_id: int | str | None = None  # for video_resolve
     size: int | None = None            # bytes, when known (upload-limit checks)
 
@@ -33,6 +41,17 @@ def _to_int(value) -> int | None:
         return None
     if isinstance(value, (int, float)):
         return int(value)
+    if isinstance(value, str):
+        # MAX sometimes sends numeric fields (e.g. file size) as strings; parse
+        # them so size-based checks (oversize pre-check) still apply.
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return int(float(text))
+            except ValueError:
+                return None
     return None
 
 
@@ -58,110 +77,108 @@ def _human_size(size) -> str:
     return f"{size:.1f} ТБ"
 
 
-def _attach_type(attach: dict) -> str:
-    return (attach.get("_type") or attach.get("type") or "").upper()
-
-
-def _first_url(attach: dict, *keys: str) -> str | None:
-    for key in keys:
-        value = attach.get(key)
-        if isinstance(value, str) and value.startswith("http"):
-            return value
+def _attach_field(attach, *names: str):
+    """Read a field from a PyMax model or an embedded forward attach dict."""
+    if isinstance(attach, dict):
+        for name in names:
+            if name in attach and attach[name] is not None:
+                return attach[name]
+        return None
+    for name in names:
+        val = getattr(attach, name, None)
+        if val is not None:
+            return val
     return None
 
 
-def _parse_one(attach: dict) -> ParsedAttach | None:
-    kind = _attach_type(attach)
+def _attach_kind(attach) -> str:
+    """Normalized upper-case attachment type for a typed PyMax attachment.
+
+    ``attach.type`` is an ``AttachmentType`` str-enum for known types (``.value``
+    == "PHOTO") and a plain ``str`` for ``UnknownAttachment``; handle both.
+    Embedded forward payloads use a raw dict with ``_type``.
+    """
+    if isinstance(attach, dict):
+        raw = attach.get("_type") or attach.get("type") or ""
+        return str(raw).upper()
+    type_attr = getattr(attach, "type", "") or ""
+    value = getattr(type_attr, "value", type_attr)
+    return str(value).upper()
+
+
+def _http_url(value) -> str | None:
+    return value if isinstance(value, str) and value.startswith("http") else None
+
+
+def _parse_one(attach) -> ParsedAttach | None:
+    kind = _attach_kind(attach)
 
     if kind == "PHOTO":
-        url = _first_url(attach, "baseUrl", "url")
-        mp4 = _first_url(attach, "mp4Url")
-        if mp4:
-            return ParsedAttach("animation", "🖼 GIF", mp4)
+        url = _http_url(_attach_field(attach, "base_url", "baseUrl"))
         if url:
             return ParsedAttach("photo", "🖼 Фото", url)
         return ParsedAttach("note", "🖼 Фото [не удалось получить ссылку]")
 
     if kind == "STICKER":
-        mp4 = _first_url(attach, "mp4Url")
-        url = _first_url(attach, "url", "lottieUrl")
-        if mp4:
-            return ParsedAttach("animation", "🩷 Стикер", mp4)
+        url = (_http_url(_attach_field(attach, "url"))
+               or _http_url(_attach_field(attach, "lottie_url", "lottieUrl")))
         if url:
             return ParsedAttach("sticker", "🩷 Стикер", url)
         return ParsedAttach("note", "🩷 Стикер")
 
     if kind == "VIDEO":
-        url = _first_url(attach, "url")
-        if url:
-            return ParsedAttach("video", "🎞 Видео", url)
-        video_id = attach.get("videoId") or attach.get("id")
+        video_id = _attach_field(attach, "video_id", "videoId")
         if video_id is not None:
             return ParsedAttach("video_resolve", "🎞 Видео", video_id=video_id)
         return ParsedAttach("note", "🎞 Видео — открыть в MAX")
 
-    # MAX marks voice messages as "UNSUPPORTED" but still ships an audioId +
-    # duration, so detect them by audioId regardless of the declared type.
-    if kind == "AUDIO" or attach.get("audioId") is not None:
-        url = _first_url(attach, "url")
-        suffix = _format_duration(attach.get("duration"))
-        label = f"🎤 Голосовое{suffix}"
+    if kind == "AUDIO":
+        url = _http_url(_attach_field(attach, "url"))
+        label = f"🎤 Голосовое{_format_duration(_attach_field(attach, 'duration'))}"
         if url:
             return ParsedAttach("voice", label, url)
-        # MAX marks mobile voices as UNSUPPORTED with no url and no resolvable
-        # source (the file opcode returns file.not.found), so we can only label
-        # them — the web API itself can't play these.
         return ParsedAttach("note", f"{label} — открыть в MAX")
 
     if kind == "FILE":
-        url = _first_url(attach, "url")
-        name = _safe_filename(attach.get("name"))
-        size_int = _to_int(attach.get("size"))
+        name = _safe_filename(_attach_field(attach, "name"))
+        size_int = _to_int(_attach_field(attach, "size"))
         size_label = _human_size(size_int)
         label = f"📎 {name}" + (f" ({size_label})" if size_label else "")
-        if url:
-            return ParsedAttach("document", label, url, filename=name, size=size_int)
-        file_id = attach.get("fileId") or attach.get("id")
+        file_id = _attach_field(attach, "file_id", "fileId")
         if file_id is not None:
             return ParsedAttach("file_resolve", label, filename=name,
                                 file_id=file_id, size=size_int)
         return ParsedAttach("note", f"{label} — открыть в MAX")
 
     if kind == "SHARE":
-        title = attach.get("title") or ""
-        url = attach.get("url") or ""
-        host = attach.get("host") or ""
-        parts = [p for p in (f"🔗 {title}".strip(), url, host) if p and p != "🔗"]
+        title = _attach_field(attach, "title") or ""
+        url = _attach_field(attach, "url") or ""
+        description = _attach_field(attach, "description") or ""
+        parts = [p for p in (f"🔗 {title}".strip(), url, description)
+                 if p and p != "🔗"]
         return ParsedAttach("link", "\n".join(parts) or "🔗 Ссылка")
 
     if kind == "CONTACT":
-        name = " ".join(
-            p for p in (attach.get("firstName"), attach.get("lastName")) if p
-        )
-        phone = attach.get("phone") or ""
-        return ParsedAttach("note", f"👤 Контакт: {name} {phone}".strip())
+        name = _attach_field(attach, "name") or " ".join(
+            p for p in (_attach_field(attach, "first_name", "firstName"),
+                        _attach_field(attach, "last_name", "lastName")) if p)
+        return ParsedAttach("note", f"👤 Контакт: {name}".strip())
 
-    if kind == "LOCATION":
-        lat, lon = attach.get("latitude"), attach.get("longitude")
-        if lat and lon:
-            return ParsedAttach(
-                "note", f"📍 Геопозиция: https://maps.google.com/?q={lat},{lon}")
-        return ParsedAttach("note", "📍 Геопозиция")
+    if kind == "CALL":
+        return ParsedAttach("note", "📞 Звонок")
 
-    if kind in ("CONTROL", "WIDGET", ""):
-        return None  # service/system attachments, nothing to show
+    # CONTROL / INLINE_KEYBOARD are service/UI attachments — nothing to show.
+    if kind in ("CONTROL", "INLINE_KEYBOARD", ""):
+        return None
 
     return ParsedAttach("note", f"📦 Вложение: {kind}")
 
 
-def parse(message: dict) -> list[ParsedAttach]:
-    raw = message.get("attaches") or message.get("attachments") or []
-    if not isinstance(raw, list):
-        return []
+def parse(message) -> list[ParsedAttach]:
+    """Parse a PyMax ``Message``'s typed ``attaches`` into ParsedAttach items."""
+    attaches = getattr(message, "attaches", None) or []
     result = []
-    for attach in raw:
-        if not isinstance(attach, dict):
-            continue
+    for attach in attaches:
         parsed = _parse_one(attach)
         if parsed:
             result.append(parsed)

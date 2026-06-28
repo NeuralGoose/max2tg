@@ -1,0 +1,31 @@
+# Test image for the max2tg bridge.
+#
+# IMPORTANT: build with the REPO ROOT as context (parent of max2tg/) so the local,
+# maintained PyMax source can be installed:
+#
+#   docker compose -f docker-compose.test.yml run --rm --build tests
+#
+# or one-off:
+#
+#   docker build -f Dockerfile.test -t max2tg-tests ..
+#   docker run --rm max2tg-tests
+FROM python:3.12-slim
+
+WORKDIR /app/max2tg
+ENV PYTHONUNBUFFERED=1
+
+# Runtime + dev deps first (better layer caching). Paths are relative to repo root.
+COPY max2tg/requirements.txt max2tg/requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+
+# requirements.txt pulls maxapi-python from PyPI; override it with the local,
+# maintained PyMax source so the tests always exercise the in-repo client
+# (--force-reinstall --no-deps swaps just the pymax package, keeping its deps).
+COPY PyMax /opt/PyMax
+RUN pip install --no-cache-dir --force-reinstall --no-deps /opt/PyMax
+
+# Bridge source.
+COPY max2tg/ ./
+
+# `python -m pytest` puts the cwd (/app/max2tg) on sys.path so `import bridge` works.
+CMD ["python", "-m", "pytest", "tests", "-m", "not integration", "-q"]

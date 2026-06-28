@@ -1,3 +1,6 @@
-vkmax==1.0.2
+maxapi-python==2.3.1
 requests==2.34.2
-websockets==16.0
+# QR-code login (maxauth.TelegramQrHandler): qrcode renders the matrix, Pillow
+# rasterizes it to PNG so it can be uploaded to Telegram.
+qrcode==8.2
+Pillow>=10.4

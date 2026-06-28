@@ -1,11 +1,26 @@
 import os
 import sys
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import maxactions  # noqa: E402
+
+
+def _user(uid, *, name=None, first=None, last=None):
+    return SimpleNamespace(
+        id=uid,
+        names=[SimpleNamespace(name=name, first_name=first, last_name=last)])
+
+
+def _chat(cid, title):
+    return SimpleNamespace(id=cid, title=title)
+
+
+def _me(uid):
+    return SimpleNamespace(contact=SimpleNamespace(id=uid))
 
 
 class NormLinkTests(unittest.TestCase):
@@ -26,114 +41,150 @@ class NormLinkTests(unittest.TestCase):
         self.assertIsNone(maxactions._norm_link("ab"))
 
     def test_join_in_query_not_misread_as_invite(self):
-        # 'join/' inside a query string must NOT be treated as a group invite.
         self.assertEqual(maxactions._norm_link("https://max.ru/news?ref=join/x"),
                          "https://max.ru/news")
 
 
 class JoinTests(unittest.IsolatedAsyncioTestCase):
-    async def test_join_subscribes_and_reports_title(self):
-        client = AsyncMock()
-        client.invoke_method.side_effect = [
-            {"payload": {"chat": {"id": -123, "title": "Канал Х"}}},  # opcode 57
-            {"payload": {}},  # opcode 75 subscribe
-        ]
+    async def test_channel_uses_join_channel(self):
+        client = Mock()
+        client.join_channel = AsyncMock(return_value=_chat(-123, "Канал Х"))
+        client.join_group = AsyncMock()
         res = await maxactions.join(client, "@kanalx")
         self.assertIn("вступили", res.text.lower())
         self.assertIn("Канал Х", res.text)
-        self.assertEqual(client.invoke_method.call_args_list[0].kwargs["opcode"], 57)
-        sub = client.invoke_method.call_args_list[1].kwargs
-        self.assertEqual(sub["opcode"], 75)
-        self.assertTrue(sub["payload"]["subscribe"])
+        client.join_channel.assert_awaited_once_with("https://max.ru/kanalx")
+        client.join_group.assert_not_called()
 
-    async def test_join_bad_link(self):
-        client = AsyncMock()
+    async def test_group_invite_uses_join_group(self):
+        client = Mock()
+        client.join_group = AsyncMock(return_value=_chat(555, "Группа"))
+        client.join_channel = AsyncMock()
+        res = await maxactions.join(client, "https://max.ru/join/Ab9_xZ")
+        self.assertIn("Группа", res.text)
+        client.join_group.assert_awaited_once_with("join/Ab9_xZ")
+        client.join_channel.assert_not_called()
+
+    async def test_bad_link(self):
+        client = Mock()
+        client.join_channel = AsyncMock()
+        client.join_group = AsyncMock()
         res = await maxactions.join(client, "не ссылка")
         self.assertIn("ссылк", res.text.lower())
-        client.invoke_method.assert_not_called()
+        client.join_channel.assert_not_called()
+        client.join_group.assert_not_called()
 
-    async def test_join_reports_max_error(self):
-        client = AsyncMock(invoke_method=AsyncMock(return_value={"payload": {"error": "not.found"}}))
+    async def test_reports_error(self):
+        client = Mock()
+        client.join_channel = AsyncMock(side_effect=RuntimeError("not.found"))
         res = await maxactions.join(client, "@nope")
-        self.assertIn("не дал вступить", res.text)
+        self.assertIn("не удалось вступить", res.text.lower())
 
 
 class FindTests(unittest.IsolatedAsyncioTestCase):
-    async def test_phone_search_opcode_46(self):
-        client = AsyncMock(invoke_method=AsyncMock(return_value={
-            "payload": {"contact": {"id": 777, "names": [{"name": "Пётр"}]}}}))
+    async def test_phone_search(self):
+        client = Mock()
+        client.search_by_phone = AsyncMock(return_value=_user(777, name="Пётр"))
         res = await maxactions.find(client, "+7 999 123-45-67")
         self.assertIn("Пётр", res.text)
         self.assertIn("777", res.text)
-        call = client.invoke_method.call_args.kwargs
-        self.assertEqual(call["opcode"], 46)
-        self.assertEqual(call["payload"]["phone"], "+79991234567")
+        client.search_by_phone.assert_awaited_once_with("+79991234567")
 
     async def test_phone_bare_8_normalized_to_plus7(self):
-        client = AsyncMock(invoke_method=AsyncMock(return_value={
-            "payload": {"contact": {"id": 5, "names": [{"name": "X"}]}}}))
+        client = Mock()
+        client.search_by_phone = AsyncMock(return_value=_user(5, name="X"))
         await maxactions.find(client, "89991234567")
-        self.assertEqual(client.invoke_method.call_args.kwargs["payload"]["phone"], "+79991234567")
+        client.search_by_phone.assert_awaited_once_with("+79991234567")
+
+    async def test_phone_not_found(self):
+        client = Mock()
+        client.search_by_phone = AsyncMock(side_effect=RuntimeError("not found"))
+        res = await maxactions.find(client, "+79991234567")
+        self.assertIn("никто не найден", res.text.lower())
 
     async def test_numeric_id_resolves(self):
-        client = AsyncMock()
-        with patch.object(maxactions, "resolve_users",
-                          new=AsyncMock(return_value={"payload": {"contacts": [
-                              {"names": [{"firstName": "Ольга", "lastName": "Лебедева"}]}]}})):
-            res = await maxactions.find(client, "24720322")
+        client = Mock()
+        client.get_user = AsyncMock(
+            return_value=_user(24720322, first="Ольга", last="Лебедева"))
+        res = await maxactions.find(client, "24720322")
         self.assertIn("Ольга Лебедева", res.text)
+        client.get_user.assert_awaited_once_with(24720322)
 
-    async def test_username_via_opcode_89(self):
-        client = AsyncMock(invoke_method=AsyncMock(
-            return_value={"payload": {"chat": {"id": 555, "title": "Channel"}}}))
+    async def test_numeric_id_not_found(self):
+        client = Mock()
+        client.get_user = AsyncMock(return_value=None)
+        res = await maxactions.find(client, "24720322")
+        self.assertIn("не найден", res.text.lower())
+
+    async def test_group_invite_link_resolves(self):
+        client = Mock()
+        client.resolve_group_by_link = AsyncMock(return_value=_chat(555, "Группа"))
+        res = await maxactions.find(client, "https://max.ru/join/AbCdEf")
+        self.assertIn("Группа", res.text)
+        self.assertIn("555", res.text)
+        client.resolve_group_by_link.assert_awaited_once_with("join/AbCdEf")
+
+    async def test_username_link_points_to_join(self):
+        client = Mock()
+        client.resolve_group_by_link = AsyncMock()
         res = await maxactions.find(client, "@channel")
-        self.assertIn("Channel", res.text)
-        self.assertEqual(client.invoke_method.call_args.kwargs["opcode"], 89)
+        self.assertIn("/join", res.text)
+        client.resolve_group_by_link.assert_not_called()
 
     async def test_freetext_name_not_wired(self):
-        client = AsyncMock()
+        client = Mock()
         res = await maxactions.find(client, "департамент культуры Липецк")
         self.assertIn("названи", res.text.lower())
-        client.invoke_method.assert_not_called()    # must NOT send a guessed opcode
 
     async def test_overlong_query_rejected(self):
-        client = AsyncMock()
+        client = Mock()
         res = await maxactions.find(client, "1" * 100)
         self.assertIn("длинн", res.text.lower())
-        client.invoke_method.assert_not_called()
 
 
 class StartDmTests(unittest.IsolatedAsyncioTestCase):
-    async def test_sends_by_user_id_not_chat_id(self):
-        # Opens a 1:1 dialog by user_id: opcode 64 with `userId` (NOT `chatId`),
-        # which is what makes MAX create the dialog and return its real chatId.
-        client = AsyncMock(invoke_method=AsyncMock(
-            return_value={"payload": {"chatId": 7268926, "message": {"id": 1}}}))
+    def _client(self):
+        client = Mock()
+        client.me = _me(100)
+        client.get_chat_id = Mock(return_value=7268926)
+        client.send_message = AsyncMock(
+            return_value=SimpleNamespace(id="dm-msg-1"),
+        )
+        return client
+
+    async def test_sends_via_get_chat_id_and_send_message(self):
+        client = self._client()
         res = await maxactions.start_dm(client, "21243808", "привет")
         self.assertIn("Отправлено", res.text)
-        call = client.invoke_method.call_args.kwargs
-        self.assertEqual(call["opcode"], 64)
-        self.assertEqual(call["payload"]["userId"], 21243808)
-        self.assertNotIn("chatId", call["payload"])       # never in the chatId slot
-        self.assertEqual(call["payload"]["message"]["text"], "привет")
+        client.get_chat_id.assert_called_once_with(100, 21243808)
+        client.send_message.assert_awaited_once_with(7268926, "привет")
+        self.assertEqual(res.outbound_chat_id, 7268926)
+        self.assertEqual(res.outbound_message_id, "dm-msg-1")
 
     async def test_rejects_non_numeric_id(self):
-        client = AsyncMock()
+        client = self._client()
         res = await maxactions.start_dm(client, "не-число", "привет")
         self.assertIn("числовой id", res.text)
-        client.invoke_method.assert_not_called()
+        client.send_message.assert_not_called()
 
     async def test_rejects_empty_text(self):
-        client = AsyncMock()
+        client = self._client()
         res = await maxactions.start_dm(client, "5", "   ")
         self.assertIn("Пустое", res.text)
-        client.invoke_method.assert_not_called()
+        client.send_message.assert_not_called()
 
-    async def test_surfaces_max_error(self):
-        client = AsyncMock(invoke_method=AsyncMock(
-            return_value={"payload": {"error": "user.not.found"}}))
+    async def test_not_logged_in_yet(self):
+        client = self._client()
+        client.me = None
         res = await maxactions.start_dm(client, "5", "привет")
-        self.assertIn("не принял", res.text)
+        self.assertIn("подключается", res.text.lower())
+        client.send_message.assert_not_called()
+
+    async def test_surfaces_send_error(self):
+        client = self._client()
+        client.send_message = AsyncMock(side_effect=RuntimeError("boom"))
+        res = await maxactions.start_dm(client, "5", "привет")
+        self.assertIn("не удалось отправить", res.text.lower())
 
 
 if __name__ == "__main__":

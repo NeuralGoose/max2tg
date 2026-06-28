@@ -29,11 +29,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt ruff
+          pip install -r requirements.txt -r requirements-dev.txt ruff
       - name: Lint (ruff)
         run: ruff check .
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        # Match the Docker test harness (Dockerfile.test): pytest with the
+        # integration marker so live test modules (which import pytest and are
+        # marked `integration`) are collected but the real MAX/Telegram tests
+        # are excluded by default.
+        run: python -m pytest tests -m "not integration" -q
 
   docker:
     needs: test

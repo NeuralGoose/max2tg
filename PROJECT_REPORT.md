@@ -1,282 +1,112 @@
-# MAX ↔ Telegram Bridge: текущая стадия
+# MAX ↔ Telegram Bridge — обзор архитектуры
 
-## Проект
+Локальный мост между личным аккаунтом MAX и Telegram-супергруппой с Topics.
+Каждая тема Telegram = отдельный MAX-диалог, группа или канал.
 
-Путь: `C:\Claude\max2tg`
+> История миграции с устаревшего клиента `vkmax` на поддерживаемый `PyMax`
+> описана в `docs/` (документы помечены как историческая справка). Этот файл
+> описывает **текущую** архитектуру.
 
-Цель: локальный мост между личным аккаунтом MAX и Telegram-группой с Topics.
+## Состав
 
-UX: каждая тема Telegram = отдельный MAX-диалог, группа или канал.
+| Файл | Назначение |
+| --- | --- |
+| `main.py` | Точка входа: конфиг, логирование, запуск моста. |
+| `bridge.py` | Основная маршрутизация MAX ↔ Telegram, темы, дедуп, preload. |
+| `max_client.py` | Фабрика PyMax-клиента под выбранный метод входа (token/sms/qr). |
+| `maxauth.py` | Telegram-провайдеры интерактивного входа (SMS-код, 2FA, QR). |
+| `maxactions.py` | Действия в MAX по командам из Telegram (`/join`, `/find`, `/dm`). |
+| `mediamax.py` | Resolve MAX-медиа в URL и загрузка Telegram-медиа в MAX. |
+| `attaches.py` | Парсер вложений MAX. |
+| `message_content.py` | Сборка текста/автора/атрибуции из типизированного сообщения. |
+| `tg.py` | Минимальный клиент Telegram Bot API (с учётом 429/пейсинга). |
+| `state.py` | Персистентный mapping MAX-чат → Telegram-тема и дедуп. |
+| `config.py` | Чтение `config.json` + `.env`, нормализация настроек. |
+| `setup_wizard.py` | Интерактивная первичная настройка. |
 
-## Текущий статус
+## MAX-сторона (PyMax)
 
-Мост запущен и работает локально.
+Используется поддерживаемая библиотека [PyMax](https://github.com/) (типизированный
+клиент). Низкоуровневые опкоды и кастомный browser-клиент из эпохи `vkmax`
+больше не используются.
 
-Последний известный процесс:
+- Вход: `token` (вставленный web-токен), `sms` (телефон + код) или `qr`.
+- Сессия сохраняется в SQLite под `work_dir` (в Docker — на томе `/data`),
+  поэтому рестарт не требует повторного входа.
+- Входящие сообщения приходят типизированными через обработчики PyMax
+  (`on_message` / `on_message_edit` / `on_message_delete`).
+- Отправка текста/медиа и resolve файлов/видео идут через типизированный API
+  PyMax (`send_message`, `get_file_by_id`, `get_video_by_id`).
 
-- parent PID: `25844`
-- child PID: `25904`
+## Telegram-сторона
 
-Лог:
+Telegram Bot API через `requests` (`tg.py`):
 
-- `C:\Claude\max2tg\bridge.log`
+- long-poll `getUpdates` (только `message`);
+- форум-темы: `createForumTopic` / `editForumTopic`;
+- отправка `sendMessage/sendPhoto/sendDocument/...` с `message_thread_id`;
+- встроенная обработка `429 Too Many Requests` (retry-after) и пейсинг API.
 
-Состояние:
+## Режим тем (Topics)
 
-- `C:\Claude\max2tg\state.json`
+Рабочий режим для повседневного использования. Включается через
+`telegram_topics_enabled` + `telegram_forum_chat_id`:
 
-Конфиг:
+- каждый MAX-чат мапится на `message_thread_id`;
+- mapping и дедуп хранятся в `state.json`;
+- при рестарте темы не пересоздаются;
+- если тему создать нельзя (нет прав «Manage Topics»), включается аварийный
+  fallback в один Telegram-чат — это **не** полноценный режим (см. README).
 
-- `C:\Claude\max2tg\config.json`
-- содержит live-токены, не печатать и не коммитить.
+## Предзагрузка и seeding
 
-## Основная архитектура
+При старте (если включено `telegram_preload_topics`):
 
-### MAX side
+- обнаруживаются последние MAX-чаты;
+- создаются недостающие темы, у существующих обновляется заголовок/иконка;
+- при `telegram_seed_last_messages` в тему один раз отправляется последняя
+  история (глубина — `telegram_preload_message_depth`), с дедупом по
+  `state.json`, чтобы рестарты не плодили дубли.
 
-Используется неофициальный WebSocket API MAX через `vkmax` и кастомный `BrowserMaxClient`.
+Служебный `chat id = 0` (Избранное) исключается по умолчанию
+(`telegram_exclude_chat_ids`).
 
-Файлы:
+## Медиа
 
-- `max_client.py`
-- `bridge.py`
-- `mediamax.py`
-- `attaches.py`
+- **MAX → Telegram:** фото/гиф/видео/голос/аудио/документы; файлы и видео
+  резолвятся во временный URL и заливаются в Telegram. Лимит загрузки Telegram
+  ~49 MB; крупнее — текстовая пометка «открыть в MAX».
+- **Telegram → MAX:** вложение скачивается через `getFile` и заливается в MAX
+  типизированным вложением (`mediamax.send_uploaded_media`) с проверкой размера
+  и санитизацией имени файла.
+- Стикеры Telegram заливаются в MAX как файл (нативные стикеры несовместимы).
 
-MAX login:
+## Telegram → MAX (управление)
 
-- токен из `web.max.ru`;
-- `opcode=19`;
-- browser-like headers;
-- актуальная web app version.
+- обычный текст в теме чата уходит в связанный MAX-чат;
+- reply на пересланное сообщение цитирует исходное MAX-сообщение, если есть
+  mapping в памяти (`_reply_map`, ограничен по размеру);
+- команды `/join`, `/find`, `/dm` (и «умные» ссылки) выполняются в MAX; в
+  форум-супергруппе они разрешены только владельцу (по Telegram user id).
 
-Incoming MAX messages:
+## Ограничения и риски
 
-- WebSocket event `opcode=128`;
-- обработчик: `MaxToTelegramBridge._on_packet`.
+1. MAX API неофициальный; PyMax инкапсулирует изменения, но они возможны.
+2. Reply-map хранится в памяти: после рестарта reply на старые Telegram-сообщения
+   может не знать MAX message id (обычное сообщение в теме всё равно уйдёт в
+   правильный чат).
+3. Один bot token = один процесс: несколько `getUpdates`-потоков дают
+   `409 Conflict`.
+4. `config.json` содержит токены — не коммитить, права ограничиваются на запись.
 
-Message sending:
+## Запуск и тесты
 
-- текст: `vkmax.functions.messages.send_message`;
-- reply: `vkmax.functions.messages.reply_message`;
-- загрузка файлов в MAX:
-  - `opcode=87` получить upload slot;
-  - HTTP POST bytes на `slot.url`;
-  - `opcode=64` отправить сообщение с attach:
-
-```json
-{"_type": "FILE", "fileId": "..."}
+```bash
+python main.py
 ```
 
-### Telegram side
+Тесты (через Docker-харнесс, совпадает с CI):
 
-Используется Telegram Bot API через `requests`.
-
-Файл:
-
-- `tg.py`
-
-Polling:
-
-- `getUpdates`;
-- allowed updates: `message`.
-
-Forum topics:
-
-- `createForumTopic`;
-- `editForumTopic`;
-- `sendMessage/sendPhoto/sendDocument/...` с `message_thread_id`.
-
-## Topics Mode
-
-Включён режим Topics.
-
-Конфиг включает:
-
-```json
-{
-  "telegram_topics_enabled": true,
-  "telegram_forum_chat_id": -1004336585084,
-  "telegram_fallback_chat_id": 2097379459,
-  "telegram_preload_topics": true,
-  "telegram_seed_last_messages": true,
-  "telegram_preload_chat_count": 100
-}
+```bash
+docker compose -f docker-compose.test.yml run --rm --build tests
 ```
-
-Поведение:
-
-- каждый MAX chat id мапится на Telegram `message_thread_id`;
-- mapping хранится в `state.json`;
-- при рестарте темы не создаются повторно;
-- если topic создать нельзя, fallback идёт в обычный Telegram chat id.
-
-## Предзагрузка чатов
-
-При старте:
-
-- login MAX вызывается с `chatsSync=1`, `contactsSync=1`;
-- MAX возвращает список последних чатов;
-- мост создаёт недостающие Telegram topics;
-- для уже созданных topics проверяет название и при необходимости переименовывает;
-- `chat id = 0` фильтруется как служебный.
-
-Была проблема:
-
-- часть личных диалогов MAX не имела `title`;
-- мост раньше создавал темы с цифрами вроде `14336601`, `165565406`;
-- исправлено: для `DIALOG` берётся второй участник из `participants`, кроме own id, затем имя резолвится через `resolve_users`.
-
-Переименованные темы:
-
-- `14336601` → Александр
-- `165565406` → Светлана
-- `83325537` → Информер ЖКХ Липецкой области
-- `18263449` → Елена
-- `22560518` → GigaChat
-
-## Seed Last Messages
-
-Чтобы список Telegram topics выглядел как живые диалоги, а не как системная лента “Тема создана”:
-
-- добавлен `telegram_seed_last_messages`;
-- мост один раз отправляет последнее MAX-сообщение в тему;
-- id последнего seeded MAX-сообщения хранится в `state.json`;
-- при рестартах дублей нет.
-
-Важно:
-
-- системные Telegram сообщения “Тема создана” bot удалить не может;
-- Telegram API возвращает `message can't be deleted`.
-
-## Медиа MAX → Telegram
-
-Файл: `attaches.py`
-
-Поддерживается:
-
-- text;
-- photo;
-- animation/GIF;
-- sticker;
-- video;
-- voice/audio;
-- document/file;
-- share/link;
-- contact/location как text notes;
-- unknown attachments как text notes.
-
-Для файлов/видео MAX:
-
-- `mediamax.resolve_file_url`: `opcode=88`;
-- `mediamax.resolve_video_url`: `opcode=83`;
-- после resolve bridge загружает media в Telegram.
-
-Telegram upload limit:
-
-- hard cap около 49 MB.
-
-Стикеры MAX:
-
-- если Telegram принимает URL как sticker, отправляется sticker;
-- если нет, fallback как document.
-
-## Telegram → MAX
-
-Текст:
-
-- обычный текст внутри Telegram topic отправляется в связанный MAX chat;
-- reply на пересланное сообщение отправляется в MAX как reply, если есть mapping в памяти.
-
-Медиа:
-
-- Telegram file/photo/video/audio/voice/sticker скачивается через Bot API:
-  - `tg.getFile`;
-  - `https://api.telegram.org/file/bot...`;
-- затем загружается в MAX через `mediamax.send_uploaded_file`.
-
-Telegram stickers:
-
-- static → `.webp`;
-- video → `.webm`;
-- animated → `.tgs`;
-- отправляются в MAX как file attachment, не как native MAX sticker.
-
-Ограничение:
-
-- Telegram sticker id и MAX sticker id несовместимы;
-- “нативный” MAX sticker пока не реализован;
-- при ошибке upload fallback: текстовая пометка `[Telegram sticker ...]`, `[Telegram file: ...]` и т.п.
-
-## Важные файлы
-
-- `main.py` — entrypoint, логирование, запуск bridge.
-- `bridge.py` — основная логика маршрутизации MAX ↔ Telegram.
-- `max_client.py` — browser-like MAX websocket client.
-- `mediamax.py` — resolve MAX media и upload Telegram media в MAX.
-- `attaches.py` — парсер MAX attachments.
-- `tg.py` — минимальный Telegram Bot API client.
-- `state.py` — persistent mapping MAX chat → Telegram topic.
-- `config.py` — чтение `config.json` и env.
-- `tests/test_topics.py` — topic routing tests.
-- `tests/test_mediamax.py` — upload helper tests.
-
-## Проверки
-
-Последний прогон:
-
-```powershell
-venv\Scripts\python.exe -m unittest discover -s tests -v
-venv\Scripts\python.exe -m py_compile main.py bridge.py config.py max_client.py state.py tg.py attaches.py mediamax.py
-```
-
-Результат:
-
-- 13 tests OK;
-- py_compile OK.
-
-## Текущие ограничения и риски
-
-1. MAX API неофициальный, reverse-engineered from `web.max.ru`.
-2. Upload API MAX может измениться.
-3. Telegram → MAX media сейчас отправляется как MAX file attachment, не native photo/sticker object.
-4. Reply-map для конкретных пересланных сообщений хранится в памяти; после рестарта reply на старые Telegram-сообщения может не знать MAX message id. Обычное сообщение внутри topic всё равно уйдёт в правильный MAX chat.
-5. Telegram Bot API polling конфликтует, если запущено больше одного процесса с тем же bot token. Следить за `409 Conflict`.
-6. `config.json` содержит live Telegram/MAX tokens; не показывать и не коммитить.
-
-## Как запускать
-
-```powershell
-cd C:\Claude\max2tg
-venv\Scripts\python.exe main.py
-```
-
-Обычно запускается скрытым процессом через:
-
-```powershell
-Start-Process -FilePath "C:\Claude\max2tg\venv\Scripts\python.exe" `
-  -ArgumentList "main.py" `
-  -WorkingDirectory "C:\Claude\max2tg" `
-  -WindowStyle Hidden
-```
-
-## Как проверить живой процесс
-
-```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -match 'C:\\Claude\\max2tg|main\.py' } |
-  Select-Object ProcessId, ParentProcessId, CommandLine |
-  Format-List
-```
-
-## Что делать дальше
-
-Приоритетные улучшения:
-
-1. Протестировать Telegram sticker → MAX upload вручную в живом чате.
-2. Если MAX принимает `.webp/.webm/.tgs` как файл, оставить как есть.
-3. Если нужен именно native MAX sticker, надо реверсить endpoint/модель sticker assets и mapping stickerId.
-4. Добавить persistent reply map, чтобы reply на старые Telegram-сообщения после рестарта мог цитировать MAX message id.
-5. Добавить media album/grouped forwarding.
-6. Добавить whitelist/blacklist MAX chats.
-7. Добавить health command в Telegram, например `/status`.
