@@ -7,6 +7,7 @@ from formatting import (
     clip_entities,
     extract_elements,
     max_elements_to_telegram,
+    py_index_to_utf16,
     shift_entities,
     split_entities_for_chunk,
     split_text_utf16,
@@ -15,6 +16,10 @@ from formatting import (
     utf16_len,
     utf16_slice,
 )
+
+
+def _utf16_off(text: str, substring: str) -> int:
+    return py_index_to_utf16(text, text.index(substring))
 
 
 class Utf16Tests(unittest.TestCase):
@@ -166,6 +171,153 @@ class TelegramToMaxTests(unittest.TestCase):
             "entities": [{"type": "bold", "offset": 0, "length": 5}],
         }
         self.assertEqual(telegram_message_markdown(message), "**Hello**")
+
+    def test_nested_bold_and_italic_same_span(self):
+        word = "французских"
+        length = utf16_len(word)
+        result = telegram_entities_to_markdown(word, [
+            {"type": "bold", "offset": 0, "length": length},
+            {"type": "italic", "offset": 0, "length": length},
+        ])
+        self.assertEqual(result, f"**_{word}_**")
+
+    def test_adjacent_and_overlapping_russian_styles(self):
+        line = "Съешь ещё этих мягких французских булок, да выпей же чаю"
+        result = telegram_entities_to_markdown(line, [
+            {
+                "type": "underline",
+                "offset": _utf16_off(line, "ещё"),
+                "length": utf16_len("ещё"),
+            },
+            {
+                "type": "bold",
+                "offset": _utf16_off(line, "мягких"),
+                "length": utf16_len("мягких"),
+            },
+            {
+                "type": "bold",
+                "offset": _utf16_off(line, "французских"),
+                "length": utf16_len("французских"),
+            },
+            {
+                "type": "italic",
+                "offset": _utf16_off(line, "французских"),
+                "length": utf16_len("французских"),
+            },
+            {
+                "type": "underline",
+                "offset": _utf16_off(line, "булок"),
+                "length": utf16_len("булок"),
+            },
+            {
+                "type": "strikethrough",
+                "offset": _utf16_off(line, "да выпей же"),
+                "length": utf16_len("да выпей же"),
+            },
+        ])
+        self.assertIn("__ещё__", result)
+        self.assertIn("**мягких**", result)
+        self.assertIn(f"**_{'французских'}_**", result)
+        self.assertIn("__булок__", result)
+        self.assertIn("~~да выпей же~~", result)
+        self.assertNotIn("булокк", result)
+        self.assertNotIn("жее", result)
+        self.assertNotRegex(result, r"ских_их\*\*")
+
+    def test_pre_block(self):
+        code = 'print("Hello, world!")'
+        text = f"before\n{code}\nafter"
+        offset = _utf16_off(text, code)
+        result = telegram_entities_to_markdown(text, [{
+            "type": "pre",
+            "offset": offset,
+            "length": utf16_len(code),
+        }])
+        self.assertEqual(
+            result,
+            f"before\n```{code}```\nafter",
+        )
+
+    def test_formatting_stress_message_like_user_sample(self):
+        text = (
+            "Это тест форматирования!\n\n"
+            "Съешь ещё этих мягких французских булок, да выпей же чаю\n\n"
+            'print("Hello, world!")\n\n'
+            "Hello, world!\n\n"
+            "Ссылка на сайт ПТУ!\n\n"
+            "Дата!"
+        )
+        line2 = "Съешь ещё этих мягких французских булок, да выпей же чаю"
+        line2_start = _utf16_off(text, line2)
+        entities = [
+            {
+                "type": "bold",
+                "offset": _utf16_off(text, "Это тест форматирования!"),
+                "length": utf16_len("Это тест форматирования!"),
+            },
+            {
+                "type": "underline",
+                "offset": line2_start + _utf16_off(line2, "ещё"),
+                "length": utf16_len("ещё"),
+            },
+            {
+                "type": "strikethrough",
+                "offset": line2_start + _utf16_off(line2, "этих мягких"),
+                "length": utf16_len("этих мягких"),
+            },
+            {
+                "type": "bold",
+                "offset": line2_start + _utf16_off(line2, "мягких"),
+                "length": utf16_len("мягких"),
+            },
+            {
+                "type": "bold",
+                "offset": line2_start + _utf16_off(line2, "французских"),
+                "length": utf16_len("французских"),
+            },
+            {
+                "type": "italic",
+                "offset": line2_start + _utf16_off(line2, "французских"),
+                "length": utf16_len("французских"),
+            },
+            {
+                "type": "underline",
+                "offset": line2_start + _utf16_off(line2, "булок"),
+                "length": utf16_len("булок"),
+            },
+            {
+                "type": "strikethrough",
+                "offset": line2_start + _utf16_off(line2, "да выпей же"),
+                "length": utf16_len("да выпей же"),
+            },
+            {
+                "type": "pre",
+                "offset": _utf16_off(text, 'print("Hello, world!")'),
+                "length": utf16_len('print("Hello, world!")'),
+            },
+            {
+                "type": "blockquote",
+                "offset": _utf16_off(
+                    text,
+                    "\n\nHello, world!\n\n",
+                ) + utf16_len("\n\n"),
+                "length": utf16_len("Hello, world!"),
+            },
+            {
+                "type": "text_link",
+                "offset": _utf16_off(text, "Ссылка на сайт ПТУ!"),
+                "length": utf16_len("Ссылка на сайт ПТУ!"),
+                "url": "https://mai.ru/",
+            },
+        ]
+        result = telegram_entities_to_markdown(text, entities)
+        self.assertIn("**Это тест форматирования!**", result)
+        self.assertIn(f"**_{'французских'}_**", result)
+        self.assertIn("```print(\"Hello, world!\")```", result)
+        self.assertIn("> Hello, world!", result)
+        self.assertIn("[Ссылка на сайт ПТУ!](https://mai.ru/)", result)
+        self.assertNotIn("булокк", result)
+        self.assertNotIn("жее", result)
 
 
 class SplitHelpersTests(unittest.TestCase):

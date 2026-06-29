@@ -25,6 +25,16 @@ _TG_TO_MD = {
     "pre": ("```", "```"),
 }
 
+# Inner styles open/close before outer when spans share a boundary (Telegram nesting).
+_TG_STYLE_ORDER = {
+    "italic": 0,
+    "bold": 1,
+    "underline": 2,
+    "strikethrough": 3,
+    "code": 4,
+    "pre": 5,
+}
+
 
 def utf16_len(text: str) -> int:
     """Length of ``text`` in UTF-16 code units (Telegram/MAX offset scheme)."""
@@ -316,15 +326,22 @@ def build_delivery_formatted(
     return formatted_text.with_prefix(prefix)
 
 
-def telegram_entities_to_markdown(
+def _marker_pair(entity_type: str) -> tuple[str, str] | None:
+    return _TG_TO_MD.get(entity_type)
+
+
+def _style_priority(entity_type: str) -> int:
+    return _TG_STYLE_ORDER.get(entity_type, 99)
+
+
+def _validate_telegram_entities(
     text: str,
     entities: list[dict[str, Any]] | None,
-) -> str:
-    """Convert Telegram entities on ``text`` into MAX-compatible markdown."""
+) -> list[dict[str, Any]]:
     if not text or not entities:
-        return text
-    valid: list[dict[str, Any]] = []
+        return []
     text_len = utf16_len(text)
+    valid: list[dict[str, Any]] = []
     for entity in entities:
         if not isinstance(entity, dict):
             continue
@@ -336,33 +353,96 @@ def telegram_entities_to_markdown(
         if offset < 0 or length <= 0 or offset + length > text_len:
             continue
         valid.append(entity)
+    return valid
+
+
+def _insert_at_original_utf16(text: str, result: str, utf16_pos: int, marker: str) -> str:
+    """Insert ``marker`` at a UTF-16 boundary of the original ``text``."""
+    py_idx = utf16_index_to_py(text, utf16_pos)
+    return result[:py_idx] + marker + result[py_idx:]
+
+
+def _py_at_original_utf16(
+    text: str,
+    utf16_pos: int,
+    applied: list[tuple[int, int]],
+) -> int:
+    """Map an original UTF-16 boundary into the current result string."""
+    py = utf16_index_to_py(text, utf16_pos)
+    for pos, delta in applied:
+        if pos < utf16_pos:
+            py += delta
+    return py
+
+
+def _edit_sort_key(
+    item: tuple[int, int, int, str, int | None],
+) -> tuple[int, int, int]:
+    utf16_pos, kind, priority, _payload, _span_len = item
+    if kind == 0:
+        # Close markers at the same boundary: outer style before inner.
+        return (-utf16_pos, kind, -priority)
+    if kind == 1:
+        # Open markers at the same boundary: inner style before outer.
+        return (-utf16_pos, kind, priority)
+    return (-utf16_pos, kind, priority)
+
+
+def telegram_entities_to_markdown(
+    text: str,
+    entities: list[dict[str, Any]] | None,
+) -> str:
+    """Convert Telegram entities on ``text`` into MAX-compatible markdown."""
+    valid = _validate_telegram_entities(text, entities)
     if not valid:
         return text
-    ordered = sorted(valid, key=lambda item: int(item["offset"]), reverse=True)
-    result = text
-    for entity in ordered:
+
+    edits: list[tuple[int, int, int, str, int | None]] = []
+
+    for entity in valid:
         etype = str(entity.get("type") or "")
         offset = int(entity["offset"])
         length = int(entity["length"])
-        segment = utf16_slice(text, offset, length)
+        end = offset + length
+        priority = _style_priority(etype)
+
         if etype == "text_link":
             url = entity.get("url")
             if not url:
                 continue
-            wrapped = f"[{segment}]({url})"
+            segment = utf16_slice(text, offset, length)
+            edits.append((
+                offset, 2, priority,
+                f"[{segment}]({url})",
+                length,
+            ))
         elif etype == "blockquote":
+            segment = utf16_slice(text, offset, length)
             wrapped = "\n".join(
                 f"> {line}" if line else ">"
                 for line in segment.splitlines()
             )
-        elif etype in _TG_TO_MD:
-            left, right = _TG_TO_MD[etype]
-            wrapped = f"{left}{segment}{right}"
+            edits.append((offset, 2, priority, wrapped, length))
+        elif pair := _marker_pair(etype):
+            left, right = pair
+            edits.append((end, 0, priority, right, None))
+            edits.append((offset, 1, priority, left, None))
+
+    # Higher UTF-16 positions first; per-kind nesting order via _edit_sort_key.
+    edits.sort(key=_edit_sort_key)
+
+    result = text
+    applied: list[tuple[int, int]] = []
+    for utf16_pos, kind, _priority, payload, span_len in edits:
+        start_py = _py_at_original_utf16(text, utf16_pos, applied)
+        if kind == 2:
+            end_py = _py_at_original_utf16(text, utf16_pos + int(span_len), applied)
+            result = result[:start_py] + payload + result[end_py:]
+            applied.append((utf16_pos, len(payload) - (end_py - start_py)))
         else:
-            continue
-        start = utf16_index_to_py(text, offset)
-        end = utf16_index_to_py(text, offset + length)
-        result = result[:start] + wrapped + result[end:]
+            result = result[:start_py] + payload + result[start_py:]
+            applied.append((utf16_pos, len(payload)))
+
     return result
 
 

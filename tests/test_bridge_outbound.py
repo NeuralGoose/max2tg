@@ -104,6 +104,52 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
         bridge._client.send_message.assert_awaited_once_with(
             555, "**bold**", reply_to=42)
 
+    async def test_telegram_multi_entity_reply_converts_to_markdown(self):
+        bridge = self._bridge(telegram_confirm_sent=False)
+        bridge._client = self._client()
+        bridge._reply_map[100] = self._target(message_id=42)
+        line = "Съешь ещё этих мягких французских булок, да выпей же чаю"
+        from formatting import py_index_to_utf16, utf16_len
+
+        def off(substring: str) -> int:
+            return py_index_to_utf16(line, line.index(substring))
+
+        update = {"message": {
+            "chat": {"id": 111},
+            "reply_to_message": {"message_id": 100},
+            "text": line,
+            "entities": [
+                {"type": "underline", "offset": off("ещё"), "length": utf16_len("ещё")},
+                {"type": "bold", "offset": off("мягких"), "length": utf16_len("мягких")},
+                {
+                    "type": "bold",
+                    "offset": off("французских"),
+                    "length": utf16_len("французских"),
+                },
+                {
+                    "type": "italic",
+                    "offset": off("французских"),
+                    "length": utf16_len("французских"),
+                },
+                {
+                    "type": "underline",
+                    "offset": off("булок"),
+                    "length": utf16_len("булок"),
+                },
+                {
+                    "type": "strikethrough",
+                    "offset": off("да выпей же"),
+                    "length": utf16_len("да выпей же"),
+                },
+            ],
+        }}
+        with patch("bridge.tg.send_message", return_value=1):
+            await bridge._handle_update(update)
+        sent_text = bridge._client.send_message.await_args.args[1]
+        self.assertIn("**_французских_**", sent_text)
+        self.assertNotIn("булокк", sent_text)
+        self.assertNotIn("жее", sent_text)
+
 
 if __name__ == "__main__":
     unittest.main()
