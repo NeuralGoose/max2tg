@@ -267,6 +267,14 @@ class ConfigTests(unittest.TestCase):
         })
         self.assertTrue(config["telegram_confirm_sent"])
 
+    def test_mark_read_on_forward_defaults_to_false(self):
+        config = normalize_config({
+            "telegram_bot_token": "token",
+            "telegram_chat_id": "123",
+            "max_login_token": "max",
+        })
+        self.assertFalse(config["max_mark_read_on_telegram_forward"])
+
     def test_corrupt_config_is_logged(self):
         import config as config_module
         with tempfile.TemporaryDirectory() as tmp:

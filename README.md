@@ -329,6 +329,18 @@ docker compose up -d      # подтянет ghcr.io/neuralgoose/max2tg:latest
 </details>
 
 <details>
+<summary><b>Снимать непрочитанное в MAX после пересылки в Telegram</b></summary>
+
+<br>Если мост работает под тем же MAX-аккаунтом, что и телефон, непрочитанные
+чаты в MAX могут копиться, пока вы читаете зеркало в Telegram. Опция
+<code>"max_mark_read_on_telegram_forward": true</code> (или
+<code>MAX2TG_MAX_MARK_READ_ON_TELEGRAM_FORWARD=true</code>) после успешной
+пересылки сообщения вызывает отметку прочитанного на стороне MAX для этого
+аккаунта. Это не синхронизирует «прочитано» в приложении Telegram — только
+сбрасывает счётчик непрочитанного в MAX у сессии моста.
+</details>
+
+<details>
 <summary><b>Мост пишет, что токен MAX устарел</b></summary>
 
 <br>Получите свежий токен на <a href="https://web.max.ru">web.max.ru</a> (та же

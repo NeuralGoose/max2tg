@@ -163,6 +163,10 @@ def normalize_config(data: dict) -> dict:
         result.get("telegram_mirror_edit_marker"),
         default=True,
     )
+    result["max_mark_read_on_telegram_forward"] = _coerce_bool(
+        result.get("max_mark_read_on_telegram_forward"),
+        default=False,
+    )
     result["telegram_exclude_chat_ids"] = _parse_exclude_chat_ids(
         result.get("telegram_exclude_chat_ids"),
     )
@@ -229,6 +233,7 @@ ENV_MAP = {
     "telegram_resync_titles": "MAX2TG_TELEGRAM_RESYNC_TITLES",
     "telegram_confirm_sent": "MAX2TG_TELEGRAM_CONFIRM_SENT",
     "telegram_mirror_edit_marker": "MAX2TG_TELEGRAM_MIRROR_EDIT_MARKER",
+    "max_mark_read_on_telegram_forward": "MAX2TG_MAX_MARK_READ_ON_TELEGRAM_FORWARD",
     "telegram_exclude_chat_ids": "MAX2TG_TELEGRAM_EXCLUDE_CHAT_IDS",
 }
 

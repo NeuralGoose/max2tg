@@ -14,6 +14,7 @@ import maxactions
 import mediamax
 import message_content
 import tg
+from pymax import WebClient
 from formatting import (
     FormattedText,
     build_delivery_formatted,
@@ -108,6 +109,9 @@ class MaxToTelegramBridge:
         self._mirror_edit_marker = bool(
             config.get("telegram_mirror_edit_marker", True),
         )
+        self._mark_read_on_forward = bool(
+            config.get("max_mark_read_on_telegram_forward", False),
+        )
         self._own_id: int | None = None
         # Bounded LRU so a long-running process can't grow the cache forever.
         self._name_cache: "OrderedDict[int, str]" = OrderedDict()
@@ -174,6 +178,35 @@ class MaxToTelegramBridge:
             return
         self._delivered_cache.add(key)
         self._state.mark_delivered(chat_id, message_id)
+
+    @staticmethod
+    def _max_read_message_id(client, max_message_id) -> int | str:
+        """PyMax wire format: str for WebClient, int for TCP Client."""
+        if isinstance(client, WebClient):
+            return str(max_message_id)
+        return int(max_message_id)
+
+    async def _mark_max_read_if_enabled(
+        self, client, chat_id, max_message_id,
+    ) -> None:
+        if not self._mark_read_on_forward:
+            return
+        if client is None or chat_id is None or max_message_id is None:
+            return
+        if self._is_excluded_chat(chat_id):
+            return
+        msg_id = self._max_read_message_id(client, max_message_id)
+        try:
+            await client.read_message(msg_id, int(chat_id))
+        except Exception as exc:
+            _logger.warning(
+                "Could not mark MAX message %s read in chat %s: %s",
+                max_message_id, chat_id, exc,
+            )
+
+    async def _after_full_delivery(self, client, chat_id, message_id) -> None:
+        self._mark_delivered(chat_id, message_id)
+        await self._mark_max_read_if_enabled(client, chat_id, message_id)
 
     def _mark_max_outbound(self, chat_id, sent_message) -> None:
         """Mark a MAX message we sent (Telegram reply, /dm, etc.) so its echo is not re-forwarded."""
@@ -981,7 +1014,7 @@ class MaxToTelegramBridge:
         text_reply_quote = (
             None if reply_parameters and resolved.reply_quote else resolved.reply_quote
         )
-        delivered, first_msg_id, _fully = await self._deliver_to_telegram(
+        delivered, first_msg_id, fully_delivered = await self._deliver_to_telegram(
             client,
             f"MAX | {sender} (chat {chat_id})",
             message_formatted,
@@ -999,6 +1032,9 @@ class MaxToTelegramBridge:
         )
         if not delivered:
             return False
+
+        if fully_delivered:
+            await self._mark_max_read_if_enabled(client, chat_id, message_id)
 
         self._state.mark_seeded_message(
             chat_id,
@@ -1558,7 +1594,9 @@ class MaxToTelegramBridge:
                     reply_parent_max_id=resolved.reply_parent_max_id,
                 )
                 if delivered and fully_delivered:
-                    self._mark_delivered(chat_id, max_message_id)
+                    await self._after_full_delivery(
+                        client, chat_id, max_message_id,
+                    )
                     _logger.info("Forwarded from %s (chat %s, %d attach)",
                                  sender, chat_id, len(parsed))
                 elif delivered:
@@ -1602,7 +1640,9 @@ class MaxToTelegramBridge:
                 reply_parent_max_id=reply_parent_max_id,
             )
             if delivered and fully_delivered:
-                self._mark_delivered(chat_id, max_message_id)
+                await self._after_full_delivery(
+                    client, chat_id, max_message_id,
+                )
                 _logger.info("Re-forwarded from %s (chat %s) into recreated "
                              "topic.", sender, chat_id)
         except Exception:

@@ -577,6 +577,49 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("мой ответ", body)
             self.assertNotIn("оригинал", body)
 
+    async def test_mark_read_on_forward_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(
+                tmp, max_mark_read_on_telegram_forward=True,
+            )
+            client = self._client()
+            client.read_message = AsyncMock()
+            bridge._client = client
+            with patch("bridge.tg.create_forum_topic", return_value=42), \
+                    patch("bridge.tg.send_message", return_value=10):
+                await bridge._on_message(_message(id=99, text="привет"), client)
+
+            client.read_message.assert_awaited_once_with(99, 555)
+
+    async def test_mark_read_on_forward_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            self.assertFalse(bridge._mark_read_on_forward)
+            client = self._client()
+            client.read_message = AsyncMock()
+            with patch("bridge.tg.create_forum_topic", return_value=42), \
+                    patch("bridge.tg.send_message", return_value=10):
+                await bridge._on_message(_message(text="привет"), client)
+
+            client.read_message.assert_not_called()
+
+    async def test_mark_read_skipped_on_partial_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(
+                tmp, max_mark_read_on_telegram_forward=True,
+            )
+            client = self._client()
+            client.read_message = AsyncMock()
+            with patch.object(
+                bridge, "_forward", new_callable=AsyncMock,
+                return_value=(True, False),
+            ):
+                await bridge._handle_incoming_message(
+                    _message(id=99, text="частично"), client,
+                )
+
+            client.read_message.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
