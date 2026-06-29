@@ -89,6 +89,21 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
         bridge._client.send_message.assert_awaited_once_with(
             555, "ответ", reply_to=42)
 
+    async def test_telegram_bold_reply_converts_to_markdown(self):
+        bridge = self._bridge(telegram_confirm_sent=False)
+        bridge._client = self._client()
+        bridge._reply_map[100] = self._target(message_id=42)
+        update = {"message": {
+            "chat": {"id": 111},
+            "reply_to_message": {"message_id": 100},
+            "text": "bold",
+            "entities": [{"type": "bold", "offset": 0, "length": 4}],
+        }}
+        with patch("bridge.tg.send_message", return_value=1):
+            await bridge._handle_update(update)
+        bridge._client.send_message.assert_awaited_once_with(
+            555, "**bold**", reply_to=42)
+
 
 if __name__ == "__main__":
     unittest.main()

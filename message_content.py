@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+
+import formatting
 
 _logger = logging.getLogger(__name__)
 
@@ -26,6 +28,7 @@ class ResolvedMessage:
     author: str
     attribution: str | None
     is_forward: bool
+    elements: list[Any] = field(default_factory=list)
     forward_attempted: bool = False
 
 
@@ -90,6 +93,7 @@ def _message_from_embedded(embedded: dict[str, Any]) -> SimpleNamespace:
         sender=embedded.get("sender"),
         text=(embedded.get("text") or "").strip(),
         attaches=list(embedded.get("attaches") or []),
+        elements=list(embedded.get("elements") or []),
         model_extra={"link": embedded.get("link")} if embedded.get("link") else {},
     )
 
@@ -176,15 +180,16 @@ async def _resolve_forward_link(
     own_id: int | None,
     resolve_sender_name: Callable[[int], Awaitable[str]],
     _depth: int,
-) -> tuple[str, list[Any], Any, bool] | None:
-    """Returns (text, attaches, sender_id, used_embedded) or None if not handled."""
+) -> tuple[str, list[Any], list[Any], Any, bool] | None:
+    """Returns (text, attaches, elements, sender_id, used_embedded) or None."""
     embedded = _embedded_forward_payload(link)
     if embedded is not None:
         text = (embedded.get("text") or "").strip()
         attaches_list = list(embedded.get("attaches") or [])
+        elements_list = formatting.extract_elements(embedded)
         sender_id = embedded.get("sender")
         if _has_visible_body(text, attaches_list):
-            return text, attaches_list, sender_id, True
+            return text, attaches_list, elements_list, sender_id, True
         if _depth + 1 < _MAX_FORWARD_DEPTH:
             nested = await resolve_message_content(
                 _message_from_embedded(embedded),
@@ -196,7 +201,7 @@ async def _resolve_forward_link(
                 _depth=_depth + 1,
             )
             if _has_visible_body(nested.text, nested.attaches):
-                return nested.text, nested.attaches, embedded.get("sender"), True
+                return nested.text, nested.attaches, nested.elements, embedded.get("sender"), True
 
     forward_ref = (
         _parse_flat_forward_link(link)
@@ -212,6 +217,7 @@ async def _resolve_forward_link(
     if original is not None:
         text = (getattr(original, "text", "") or "").strip()
         attaches_list = list(getattr(original, "attaches", None) or [])
+        elements_list = formatting.extract_elements(original)
         sender_id = getattr(original, "sender", None)
         if (not _has_visible_body(text, attaches_list)
                 and _depth + 1 < _MAX_FORWARD_DEPTH):
@@ -225,8 +231,8 @@ async def _resolve_forward_link(
                 _depth=_depth + 1,
             )
             if _has_visible_body(nested.text, nested.attaches):
-                return nested.text, nested.attaches, sender_id, False
-        return text, attaches_list, sender_id, False
+                return nested.text, nested.attaches, nested.elements, sender_id, False
+        return text, attaches_list, elements_list, sender_id, False
 
     return None
 
@@ -244,6 +250,7 @@ async def resolve_message_content(
     """Resolve text/attaches/author, fetching FORWARD originals when needed."""
     text = (getattr(message, "text", "") or "").strip()
     attaches_list = list(getattr(message, "attaches", None) or [])
+    elements_list = formatting.extract_elements(message)
     sender_id = getattr(message, "sender", None)
     is_forward = False
     forward_attempted = False
@@ -264,7 +271,7 @@ async def resolve_message_content(
             )
             if resolved is not None:
                 is_forward = True
-                text, attaches_list, sender_id, _used_embedded = resolved
+                text, attaches_list, elements_list, sender_id, _used_embedded = resolved
             else:
                 is_forward = True
                 _logger.warning(
@@ -279,6 +286,7 @@ async def resolve_message_content(
                     link,
                 )
                 text = FORWARD_FETCH_FAILED_FALLBACK
+                elements_list = []
         elif (link_kind not in _KNOWN_LINK_TYPES
               and not _has_visible_body(text, attaches_list)):
             _logger.warning(
@@ -307,6 +315,7 @@ async def resolve_message_content(
         author=author,
         attribution=attribution,
         is_forward=is_forward,
+        elements=elements_list,
         forward_attempted=forward_attempted,
     )
 

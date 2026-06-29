@@ -44,8 +44,14 @@ class SendMediaGroupTests(unittest.TestCase):
             )
 
         self.assertEqual(ids, [10, 11])
-        photo.assert_any_call("TOK", 555, "https://cdn/a.jpg", "Cap", message_thread_id=None)
-        photo.assert_any_call("TOK", 555, "https://cdn/b.jpg", None, message_thread_id=None)
+        photo.assert_any_call(
+            "TOK", 555, "https://cdn/a.jpg", "Cap",
+            message_thread_id=None, caption_entities=None,
+        )
+        photo.assert_any_call(
+            "TOK", 555, "https://cdn/b.jpg", None,
+            message_thread_id=None, caption_entities=None,
+        )
 
 
 if __name__ == "__main__":

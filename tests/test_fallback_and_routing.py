@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from bridge import MaxToTelegramBridge
+from formatting import FormattedText
 from state import BridgeState
 
 
@@ -180,7 +181,8 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bridge, "_send_media_item",
                           new=AsyncMock(return_value=(True, 10, False))):
             delivered, _first, fully = await bridge._deliver_to_telegram(
-                Mock(), "MAX | A (chat 5)", "", [self._photo()], 5, 1, "A",
+                Mock(), "MAX | A (chat 5)", FormattedText.plain(""),
+                [self._photo()], 5, 1, "A",
                 111, None, in_topic=False, is_channel=False)
         self.assertTrue(delivered)
         self.assertFalse(fully)
@@ -190,7 +192,8 @@ class PartialDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bridge, "_send_media_item",
                           new=AsyncMock(return_value=(True, 10, True))):
             delivered, _first, fully = await bridge._deliver_to_telegram(
-                Mock(), "MAX | A (chat 5)", "", [self._photo()], 5, 1, "A",
+                Mock(), "MAX | A (chat 5)", FormattedText.plain(""),
+                [self._photo()], 5, 1, "A",
                 111, None, in_topic=False, is_channel=False)
         self.assertTrue(delivered)
         self.assertTrue(fully)

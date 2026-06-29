@@ -14,6 +14,7 @@ import maxactions
 import mediamax
 import message_content
 import tg
+from formatting import FormattedText, build_delivery_formatted, telegram_message_markdown
 from max_client import build_max_client
 from maxauth import TelegramAuthPoll
 from state import BridgeState, normalize_topic_title
@@ -757,16 +758,9 @@ class MaxToTelegramBridge:
         return "\n".join(part for part in parts if part) or header
 
     @staticmethod
-    def _split_caption(body: str) -> tuple[str, str | None]:
-        """Split body into Telegram caption (<=1024) and optional overflow text."""
-        if len(body) <= tg.MAX_CAPTION_LEN:
-            return body, None
-        cut = body[:tg.MAX_CAPTION_LEN]
-        newline = cut.rfind("\n")
-        if newline > int(tg.MAX_CAPTION_LEN * 0.7):
-            cut = cut[:newline]
-        overflow = body[len(cut):].lstrip("\n")
-        return cut, overflow or None
+    def _split_caption(body: FormattedText) -> tuple[FormattedText, FormattedText | None]:
+        """Split body into Telegram caption (<=1024 UTF-16) and optional overflow."""
+        return body.split_caption(tg.MAX_CAPTION_LEN)
 
     async def _message_sender_name(self, client, sender_id) -> str:
         if sender_id is not None and sender_id == self._own_id:
@@ -866,9 +860,9 @@ class MaxToTelegramBridge:
             own_id=self._own_id,
             resolve_sender_name=lambda uid: self._resolve_sender_name(client, uid),
         )
-        text = resolved.text
-        if self._is_locale_system_text(text):
+        if self._is_locale_system_text(resolved.text):
             return False
+        message_formatted = FormattedText.from_max(resolved.text, resolved.elements)
         parsed = attaches.parse(message_content.content_message(resolved))
         resolvable = {"file_resolve", "video_resolve"}
         media = [item for item in parsed if item.kind in _MEDIA_SENDERS]
@@ -877,7 +871,7 @@ class MaxToTelegramBridge:
             item.text for item in parsed
             if item.kind not in _MEDIA_SENDERS and item.kind not in resolvable
         ]
-        if not text and not notes and not media and not to_resolve:
+        if not message_formatted.text and not notes and not media and not to_resolve:
             return False
 
         is_channel = topic.get("chat_type") == "channel"
@@ -885,7 +879,7 @@ class MaxToTelegramBridge:
         delivered, first_msg_id, _fully = await self._deliver_to_telegram(
             client,
             f"MAX | {sender} (chat {chat_id})",
-            text,
+            message_formatted,
             parsed,
             chat_id,
             message_id,
@@ -966,7 +960,7 @@ class MaxToTelegramBridge:
         self,
         client,
         header: str,
-        text: str,
+        message_formatted: FormattedText,
         parsed: list,
         chat_id,
         max_message_id,
@@ -997,14 +991,18 @@ class MaxToTelegramBridge:
         ]
         other_media = [p for p in media if p not in album_media]
 
-        body = self._delivery_body(
-            sender, text, notes,
+        body_fmt = build_delivery_formatted(
+            message_formatted,
+            notes,
+            in_topic=in_topic,
+            sender=sender,
             is_channel=is_channel,
             attribution=attribution,
-            in_topic=in_topic,
             header=header,
         )
-        content = "\n".join(part for part in [text, *notes] if part)
+        content = "\n".join(
+            part for part in [message_formatted.text, *notes] if part
+        )
         has_content = bool(content.strip()) or bool(attribution)
         can_caption_media = bool(album_media or to_resolve)
 
@@ -1017,15 +1015,16 @@ class MaxToTelegramBridge:
         first_msg_id: int | None = None
         reply_mapped = False
         body_placed = False
-        pending_caption: str | None = None
-        pending_overflow: str | None = None
+        pending_caption: FormattedText | None = None
+        pending_overflow: FormattedText | None = None
 
         if has_content and can_caption_media:
-            pending_caption, pending_overflow = self._split_caption(body)
+            pending_caption, pending_overflow = self._split_caption(body_fmt)
         elif has_content and not can_caption_media:
             msg_id = await asyncio.to_thread(
-                tg.send_message, self._token, telegram_chat_id, body,
+                tg.send_message, self._token, telegram_chat_id, body_fmt.text,
                 message_thread_id=thread_id,
+                entities=body_fmt.entities or None,
             )
             if msg_id:
                 first_msg_id = msg_id
@@ -1056,8 +1055,11 @@ class MaxToTelegramBridge:
                             self._token,
                             telegram_chat_id,
                             items,
-                            caption,
+                            caption.text if caption else None,
                             message_thread_id=thread_id,
+                            caption_entities=(
+                                caption.entities if caption else None
+                            ),
                         )
                     except Exception as exc:
                         _logger.warning("Failed to send media group: %s", exc)
@@ -1135,10 +1137,12 @@ class MaxToTelegramBridge:
             if not ok:
                 fully_delivered = False
 
-        if pending_overflow:
+        if pending_overflow and pending_overflow.text:
             overflow_id = await asyncio.to_thread(
-                tg.send_message, self._token, telegram_chat_id, pending_overflow,
+                tg.send_message, self._token, telegram_chat_id,
+                pending_overflow.text,
                 message_thread_id=thread_id,
+                entities=pending_overflow.entities or None,
             )
             if overflow_id:
                 delivered = True
@@ -1161,8 +1165,9 @@ class MaxToTelegramBridge:
             )
         elif has_content and can_caption_media and not body_placed:
             msg_id = await asyncio.to_thread(
-                tg.send_message, self._token, telegram_chat_id, body,
+                tg.send_message, self._token, telegram_chat_id, body_fmt.text,
                 message_thread_id=thread_id,
+                entities=body_fmt.entities or None,
             )
             if msg_id:
                 first_msg_id = msg_id
@@ -1176,7 +1181,8 @@ class MaxToTelegramBridge:
 
         return delivered, first_msg_id, fully_delivered
 
-    async def _forward(self, client, header, text, parsed,
+    async def _forward(self, client, header, message_formatted: FormattedText,
+                       parsed,
                        chat_id, max_message_id, sender, chat_title, chat_type,
                        *, attribution: str | None = None) -> tuple[bool, bool]:
         """Returns (delivered, fully_delivered)."""
@@ -1191,7 +1197,7 @@ class MaxToTelegramBridge:
             delivered, _first_msg_id, fully_delivered = await self._deliver_to_telegram(
                 client,
                 header,
-                text,
+                message_formatted,
                 parsed,
                 chat_id,
                 max_message_id,
@@ -1226,17 +1232,19 @@ class MaxToTelegramBridge:
         body_placed: bool,
         ctx,
         *,
-        caption_override: str | None,
-    ) -> str | None:
+        caption_override: FormattedText | None,
+    ) -> FormattedText | None:
         (_client, header, _chat_id, _max_message_id, sender, _telegram_chat_id,
          _thread_id, in_topic, is_channel) = ctx
         if caption_override is not None:
             return caption_override
         if body_placed:
-            return item.text or None
+            return FormattedText.plain(item.text) if item.text else None
         if in_topic:
-            return self._topic_caption(sender, item.text, is_channel)
-        return self._caption(header, body_placed, item.text)
+            text = self._topic_caption(sender, item.text, is_channel)
+            return FormattedText.plain(text) if text else None
+        text = self._caption(header, body_placed, item.text)
+        return FormattedText.plain(text) if text else None
 
     async def _send_media_item(
         self,
@@ -1244,7 +1252,7 @@ class MaxToTelegramBridge:
         body_placed: bool,
         ctx,
         *,
-        caption_override: str | None = None,
+        caption_override: FormattedText | None = None,
         remember: bool = True,
     ) -> tuple[bool, int | None, bool]:
         """Returns (body_placed, telegram_msg_id, ok). ``ok`` is False when the
@@ -1252,9 +1260,11 @@ class MaxToTelegramBridge:
         caller can avoid marking the MAX message fully delivered."""
         (_client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
-        caption = self._media_item_caption(
+        caption_fmt = self._media_item_caption(
             item, body_placed, ctx, caption_override=caption_override,
         )
+        caption = caption_fmt.text if caption_fmt else None
+        caption_entities = caption_fmt.entities if caption_fmt else None
         sender_fn, supports_caption = _MEDIA_SENDERS[item.kind]
         msg_id = None
         ok = True
@@ -1262,7 +1272,8 @@ class MaxToTelegramBridge:
             if supports_caption:
                 msg_id = await asyncio.to_thread(
                     sender_fn, self._token, telegram_chat_id, item.url, caption,
-                    message_thread_id=thread_id)
+                    message_thread_id=thread_id,
+                    caption_entities=caption_entities)
             else:
                 msg_id = await asyncio.to_thread(
                     sender_fn, self._token, telegram_chat_id, item.url,
@@ -1283,7 +1294,7 @@ class MaxToTelegramBridge:
         body_placed: bool,
         ctx,
         *,
-        caption_override: str | None = None,
+        caption_override: FormattedText | None = None,
         remember: bool = True,
     ) -> tuple[bool, int | None, bool]:
         """Resolve a file/video to a temporary URL, then upload it to Telegram.
@@ -1293,9 +1304,11 @@ class MaxToTelegramBridge:
         False so the caller can retry the MAX message on the next run."""
         (client, header, chat_id, max_message_id, sender, telegram_chat_id,
          thread_id, in_topic, is_channel) = ctx
-        caption = self._media_item_caption(
+        caption_fmt = self._media_item_caption(
             item, body_placed, ctx, caption_override=caption_override,
         )
+        caption = caption_fmt.text if caption_fmt else None
+        caption_entities = caption_fmt.entities if caption_fmt else None
         msg_id = None
         if item.size and item.size > TELEGRAM_UPLOAD_LIMIT:
             note = (
@@ -1317,13 +1330,15 @@ class MaxToTelegramBridge:
                     client, item.file_id, chat_id, max_message_id)
                 msg_id = await asyncio.to_thread(
                     tg.send_document, self._token, telegram_chat_id, url,
-                    caption, item.filename, message_thread_id=thread_id)
+                    caption, item.filename, message_thread_id=thread_id,
+                    caption_entities=caption_entities)
             else:  # video_resolve
                 url = await mediamax.resolve_video_url(
                     client, item.video_id, chat_id, max_message_id)
                 msg_id = await asyncio.to_thread(
                     tg.send_video, self._token, telegram_chat_id, url, caption,
-                    message_thread_id=thread_id)
+                    message_thread_id=thread_id,
+                    caption_entities=caption_entities)
         except Exception as exc:
             _logger.warning("Failed to resolve/send %s: %s", item.kind, exc)
             note = f"{caption} — открыть в MAX" if caption else "открыть в MAX"
@@ -1373,21 +1388,29 @@ class MaxToTelegramBridge:
                     resolve_sender_name=lambda uid: self._resolve_sender_name(
                         client, uid),
                 )
-                text = resolved.text
-                if self._is_locale_system_text(text):
+                message_formatted = FormattedText.from_max(
+                    resolved.text, resolved.elements,
+                )
+                if self._is_locale_system_text(resolved.text):
                     return
                 if edited:
-                    text = (f"✏️ (изменено) {text}" if text
-                            else "✏️ (сообщение изменено)")
+                    if message_formatted.text:
+                        message_formatted = message_formatted.with_prefix(
+                            "✏️ (изменено) ",
+                        )
+                    else:
+                        message_formatted = FormattedText.plain(
+                            "✏️ (сообщение изменено)",
+                        )
                 parsed = attaches.parse(message_content.content_message(resolved))
                 sender = resolved.author
                 header = f"MAX | {sender} (чат {chat_id})"
                 # Captured so a stale-topic ("thread not found") failure can
                 # recreate the topic and retry without re-resolving everything.
-                retry_ctx = (header, text, parsed, sender, chat_title,
+                retry_ctx = (header, message_formatted, parsed, sender, chat_title,
                              chat_type, resolved.attribution)
                 delivered, fully_delivered = await self._forward(
-                    client, header, text, parsed, chat_id,
+                    client, header, message_formatted, parsed, chat_id,
                     max_message_id, sender, chat_title, chat_type,
                     attribution=resolved.attribution,
                 )
@@ -1422,10 +1445,10 @@ class MaxToTelegramBridge:
         """Re-drive a forward once after a stale topic was dropped, so the
         triggering message lands in the freshly recreated topic instead of
         being lost."""
-        header, text, parsed, sender, chat_title, chat_type, attribution = retry_ctx
+        header, message_formatted, parsed, sender, chat_title, chat_type, attribution = retry_ctx
         try:
             delivered, fully_delivered = await self._forward(
-                client, header, text, parsed, chat_id,
+                client, header, message_formatted, parsed, chat_id,
                 max_message_id, sender, chat_title, chat_type,
                 attribution=attribution,
             )
@@ -1592,15 +1615,15 @@ class MaxToTelegramBridge:
 
     @classmethod
     def _telegram_outgoing_text(cls, message: dict) -> str:
-        text = (message.get("text") or message.get("caption") or "").strip()
+        markdown = telegram_message_markdown(message)
         media_note = cls._telegram_media_note(message)
-        if media_note and text:
-            return f"{text}\n\n{media_note}"
-        return text or media_note or ""
+        if media_note and markdown:
+            return f"{markdown}\n\n{media_note}"
+        return markdown or media_note or ""
 
     async def _send_telegram_update_to_max(self, target: dict, message: dict) -> None:
         attachment = self._telegram_attachment(message)
-        caption = (message.get("caption") or "").strip()
+        caption = telegram_message_markdown(message) if message.get("caption") else ""
         if attachment and attachment.get("file_id"):
             telegram_chat_id = target.get("telegram_chat_id") or self._fallback_chat_id
             thread_id = target.get("message_thread_id")

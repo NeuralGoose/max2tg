@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from formatting import FormattedText, split_entities_for_chunk, split_text_utf16
+
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 FILE_API_BASE = "https://api.telegram.org/file/bot{token}/{file_path}"
 # (connect, read) timeouts so a stalled peer can't hang a worker thread forever.
@@ -368,23 +370,85 @@ def edit_forum_topic(
     _call(token, "editForumTopic", **params)
 
 
+def _is_entity_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "entity" in msg and ("parse" in msg or "invalid" in msg)
+
+
+def _call_with_entity_fallback(
+    token: str,
+    method: str,
+    params: dict,
+    *,
+    upload: bool = False,
+) -> dict:
+    entities = params.get("entities") or params.get("caption_entities")
+    if not entities:
+        if upload:
+            files = params.pop("files")
+            return _call_upload(token, method, files, **params)
+        return _call(token, method, **params)
+    try:
+        if upload:
+            files = params.pop("files")
+            return _call_upload(token, method, files, **params)
+        return _call(token, method, **params)
+    except RuntimeError as exc:
+        if not _is_entity_error(exc):
+            raise
+        _logger.warning(
+            "Telegram %s rejected entities, retrying plain text: %s",
+            method, exc,
+        )
+        retry_params = dict(params)
+        retry_params.pop("entities", None)
+        retry_params.pop("caption_entities", None)
+        if upload:
+            files = retry_params.pop("files")
+            return _call_upload(token, method, files, **retry_params)
+        return _call(token, method, **retry_params)
+
+
+def _prepare_caption(
+    caption: str | None,
+    caption_entities: list[dict] | None,
+) -> tuple[str | None, list[dict] | None]:
+    if not caption:
+        return None, None
+    formatted = FormattedText(caption, list(caption_entities or []))
+    clipped, _overflow = formatted.split_caption(MAX_CAPTION_LEN)
+    if not clipped.text:
+        return None, None
+    entities = clipped.entities or None
+    return clipped.text, entities
+
+
 def send_message(token: str, chat_id: int | str, text: str,
                  reply_to_message_id: int | None = None,
-                 message_thread_id: int | None = None) -> int | None:
-    """Send plain text, splitting over Telegram's length limit.
+                 message_thread_id: int | None = None,
+                 entities: list[dict] | None = None) -> int | None:
+    """Send text, splitting over Telegram's UTF-16 length limit.
 
     Returns the message_id of the first chunk (used for reply mapping).
     """
+    if not text:
+        return None
     first_id: int | None = None
-    for start in range(0, len(text), MAX_MESSAGE_LEN):
-        chunk = text[start:start + MAX_MESSAGE_LEN]
-        params = {"chat_id": chat_id, "text": chunk,
+    entity_list = list(entities or [])
+    chunks = split_text_utf16(text, MAX_MESSAGE_LEN)
+    for chunk_text, chunk_start, chunk_len in chunks:
+        chunk_entities = split_entities_for_chunk(
+            entity_list, chunk_start, chunk_len,
+        ) or None
+        params = {"chat_id": chat_id, "text": chunk_text,
                   "disable_web_page_preview": True}
         if message_thread_id:
             params["message_thread_id"] = message_thread_id
         if reply_to_message_id and first_id is None:
             params["reply_to_message_id"] = reply_to_message_id
-        result = _call(token, "sendMessage", **params)
+        if chunk_entities:
+            params["entities"] = chunk_entities
+        result = _call_with_entity_fallback(token, "sendMessage", params)
         if first_id is None:
             first_id = result.get("message_id")
     return first_id
@@ -392,16 +456,19 @@ def send_message(token: str, chat_id: int | str, text: str,
 
 def _send_media(token: str, method: str, field: str, chat_id: int | str,
                 url: str, caption: str | None, filename: str | None,
-                message_thread_id: int | None = None) -> int | None:
+                message_thread_id: int | None = None,
+                caption_entities: list[dict] | None = None) -> int | None:
     """Send media by URL, falling back to download + multipart upload."""
-    caption = (caption or "")[:MAX_CAPTION_LEN] or None
+    caption, caption_entities = _prepare_caption(caption, caption_entities)
     try:
         params = {"chat_id": chat_id, field: url}
         if message_thread_id:
             params["message_thread_id"] = message_thread_id
         if caption:
             params["caption"] = caption
-        result = _call(token, method, **params)
+        if caption_entities:
+            params["caption_entities"] = caption_entities
+        result = _call_with_entity_fallback(token, method, params)
         return result.get("message_id")
     except RateLimitError:
         # Already rate-limited: do NOT download + re-upload (extra API traffic
@@ -416,64 +483,85 @@ def _send_media(token: str, method: str, field: str, chat_id: int | str,
         params["message_thread_id"] = message_thread_id
     if caption:
         params["caption"] = caption
+    if caption_entities:
+        params["caption_entities"] = caption_entities
     files = {field: (filename or "file", content)}
-    result = _call_upload(token, method, files, **params)
+    result = _call_with_entity_fallback(
+        token, method, {**params, "files": files}, upload=True,
+    )
     return result.get("message_id")
 
 
 def send_photo(token, chat_id, url, caption=None,
-               message_thread_id: int | None = None) -> int | None:
+               message_thread_id: int | None = None,
+               caption_entities: list[dict] | None = None) -> int | None:
     return _send_media(token, "sendPhoto", "photo", chat_id, url, caption,
-                       "photo.jpg", message_thread_id)
+                       "photo.jpg", message_thread_id,
+                       caption_entities=caption_entities)
 
 
 def send_photo_bytes(token: str, chat_id: int | str, content: bytes,
                      caption: str | None = None, filename: str = "photo.png",
-                     message_thread_id: int | None = None) -> int | None:
+                     message_thread_id: int | None = None,
+                     caption_entities: list[dict] | None = None) -> int | None:
     """Upload a photo from in-memory bytes (multipart), e.g. a generated QR code.
 
     Unlike send_photo (which sends by URL), this posts the raw bytes directly, so
     it works for images the bridge produces itself.
     """
-    caption = (caption or "")[:MAX_CAPTION_LEN] or None
+    caption, caption_entities = _prepare_caption(caption, caption_entities)
     params: dict = {"chat_id": chat_id}
     if message_thread_id:
         params["message_thread_id"] = message_thread_id
     if caption:
         params["caption"] = caption
+    if caption_entities:
+        params["caption_entities"] = caption_entities
     files = {"photo": (filename, content)}
-    result = _call_upload(token, "sendPhoto", files, **params)
+    result = _call_with_entity_fallback(
+        token, "sendPhoto", {**params, "files": files}, upload=True,
+    )
     return result.get("message_id")
 
 
 def send_animation(token, chat_id, url, caption=None,
-                   message_thread_id: int | None = None) -> int | None:
+                   message_thread_id: int | None = None,
+                   caption_entities: list[dict] | None = None) -> int | None:
     return _send_media(token, "sendAnimation", "animation", chat_id, url,
-                       caption, "animation.mp4", message_thread_id)
+                       caption, "animation.mp4", message_thread_id,
+                       caption_entities=caption_entities)
 
 
 def send_video(token, chat_id, url, caption=None,
-               message_thread_id: int | None = None) -> int | None:
+               message_thread_id: int | None = None,
+               caption_entities: list[dict] | None = None) -> int | None:
     return _send_media(token, "sendVideo", "video", chat_id, url, caption,
-                       "video.mp4", message_thread_id)
+                       "video.mp4", message_thread_id,
+                       caption_entities=caption_entities)
 
 
 def send_voice(token, chat_id, url, caption=None,
-               message_thread_id: int | None = None) -> int | None:
+               message_thread_id: int | None = None,
+               caption_entities: list[dict] | None = None) -> int | None:
     return _send_media(token, "sendVoice", "voice", chat_id, url, caption,
-                       "voice.ogg", message_thread_id)
+                       "voice.ogg", message_thread_id,
+                       caption_entities=caption_entities)
 
 
 def send_audio(token, chat_id, url, caption=None,
-               message_thread_id: int | None = None) -> int | None:
+               message_thread_id: int | None = None,
+               caption_entities: list[dict] | None = None) -> int | None:
     return _send_media(token, "sendAudio", "audio", chat_id, url, caption,
-                       "audio.mp3", message_thread_id)
+                       "audio.mp3", message_thread_id,
+                       caption_entities=caption_entities)
 
 
 def send_document(token, chat_id, url, caption=None, filename=None,
-                  message_thread_id: int | None = None) -> int | None:
+                  message_thread_id: int | None = None,
+                  caption_entities: list[dict] | None = None) -> int | None:
     return _send_media(token, "sendDocument", "document", chat_id, url,
-                       caption, filename or "file", message_thread_id)
+                       caption, filename or "file", message_thread_id,
+                       caption_entities=caption_entities)
 
 
 def send_sticker(token, chat_id, url,
@@ -501,19 +589,23 @@ def _send_media_group_sequential(
     items: list[dict],
     caption: str | None,
     message_thread_id: int | None,
+    caption_entities: list[dict] | None = None,
 ) -> list[int]:
     """Fall back to individual sends when sendMediaGroup fails."""
     ids: list[int] = []
     for index, item in enumerate(items):
         item_caption = caption if index == 0 else None
+        item_entities = caption_entities if index == 0 else None
         kind = item.get("type", "photo")
         url = item["url"]
         if kind == "video":
             msg_id = send_video(token, chat_id, url, item_caption,
-                                message_thread_id=message_thread_id)
+                                message_thread_id=message_thread_id,
+                                caption_entities=item_entities)
         else:
             msg_id = send_photo(token, chat_id, url, item_caption,
-                                message_thread_id=message_thread_id)
+                                message_thread_id=message_thread_id,
+                                caption_entities=item_entities)
         if msg_id is not None:
             ids.append(msg_id)
     return ids
@@ -525,6 +617,7 @@ def send_media_group(
     items: list[dict],
     caption: str | None = None,
     message_thread_id: int | None = None,
+    caption_entities: list[dict] | None = None,
 ) -> list[int]:
     """Send 2–10 photos/videos as a Telegram album. Caption only on the first item.
 
@@ -533,7 +626,7 @@ def send_media_group(
     """
     if len(items) < 2:
         raise ValueError("send_media_group requires at least 2 items")
-    caption = (caption or "")[:MAX_CAPTION_LEN] or None
+    caption, caption_entities = _prepare_caption(caption, caption_entities)
     media_payload: list[dict] = []
     for index, item in enumerate(items):
         kind = item.get("type", "photo")
@@ -542,12 +635,14 @@ def send_media_group(
         entry: dict = {"type": kind, "media": item["url"]}
         if index == 0 and caption:
             entry["caption"] = caption
+            if caption_entities:
+                entry["caption_entities"] = caption_entities
         media_payload.append(entry)
     params: dict = {"chat_id": chat_id, "media": media_payload}
     if message_thread_id:
         params["message_thread_id"] = message_thread_id
     try:
-        result = _call(token, "sendMediaGroup", **params)
+        result = _call_with_entity_fallback(token, "sendMediaGroup", params)
         ids = [msg["message_id"] for msg in result if msg.get("message_id")]
         if ids:
             return ids
@@ -556,5 +651,5 @@ def send_media_group(
             raise
         _logger.info("sendMediaGroup failed, sending sequentially: %s", exc)
     return _send_media_group_sequential(
-        token, chat_id, items, caption, message_thread_id,
+        token, chat_id, items, caption, message_thread_id, caption_entities,
     )

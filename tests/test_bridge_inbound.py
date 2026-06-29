@@ -250,8 +250,8 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             send_media.assert_awaited_once()
             caption = send_media.await_args.kwargs.get("caption_override")
             self.assertIsNotNone(caption)
-            self.assertIn("↪", caption)
-            self.assertIn("погибшего", caption)
+            self.assertIn("↪", caption.text)
+            self.assertIn("погибшего", caption.text)
 
     async def test_forward_fetch_failure_shows_fallback_not_bare_name(self):
         with tempfile.TemporaryDirectory() as tmp:
