@@ -1,6 +1,7 @@
 """Convert rich text between MAX elements and Telegram Bot API entities."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -290,6 +291,7 @@ def build_delivery_formatted(
     is_channel: bool,
     attribution: str | None,
     header: str,
+    reply_quote: str | None = None,
 ) -> FormattedText:
     """Compose bridge delivery body/caption with formatting only on MAX text."""
     notes_part = "\n".join(part for part in notes if part)
@@ -298,14 +300,25 @@ def build_delivery_formatted(
         suffix = ("\n" if content else "") + notes_part
         formatted_text = formatted_text.append_plain_suffix(suffix)
 
+    quote_header = (
+        f"↩️ В ответ на: «{reply_quote}»" if reply_quote else None
+    )
+
     if in_topic:
         content = formatted_text.text
         prefix = ""
+        if quote_header:
+            if content:
+                prefix = f"{quote_header}\n\n"
+            else:
+                return FormattedText.plain(quote_header)
         if attribution:
             if content:
-                prefix = f"{attribution}\n\n"
-            else:
+                prefix = f"{prefix}{attribution}\n\n" if prefix else f"{attribution}\n\n"
+            elif not prefix:
                 return FormattedText.plain(attribution)
+            else:
+                return FormattedText.plain(f"{prefix.rstrip()}\n{attribution}")
         if is_channel:
             if content:
                 return formatted_text.with_prefix(prefix) if prefix else formatted_text
@@ -313,13 +326,18 @@ def build_delivery_formatted(
         if content:
             prefix = f"{sender}:\n" + prefix
             return formatted_text.with_prefix(prefix)
+        if prefix:
+            return FormattedText.plain(f"{prefix.rstrip()}\n{sender}:")
         return FormattedText.plain(f"{sender}:")
 
-    parts = [part for part in (header, attribution) if part]
+    parts = [part for part in (header, quote_header, attribution) if part]
     prefix = "\n".join(parts)
     if prefix:
         prefix += "\n"
-    body_parts = [part for part in (header, attribution, formatted_text.text) if part]
+    body_parts = [
+        part for part in (header, quote_header, attribution, formatted_text.text)
+        if part
+    ]
     body = "\n".join(body_parts)
     if not prefix:
         return FormattedText(body, list(formatted_text.entities))
@@ -457,3 +475,70 @@ def telegram_message_markdown(message: dict[str, Any]) -> str:
     else:
         return ""
     return telegram_entities_to_markdown(text, entities).strip()
+
+
+_QUOTE_SNIPPET_MAX = 120
+
+
+def _truncate_quote_snippet(text: str) -> str:
+    snippet = re.sub(r"\s+", " ", text).strip()
+    if len(snippet) > _QUOTE_SNIPPET_MAX:
+        snippet = snippet[: _QUOTE_SNIPPET_MAX - 1].rstrip() + "…"
+    return snippet
+
+
+def _telegram_reply_media_note(reply_to: dict[str, Any]) -> str:
+    if reply_to.get("sticker"):
+        sticker = reply_to["sticker"]
+        emoji = sticker.get("emoji") or ""
+        return f"[Telegram sticker {emoji}]".strip()
+    if reply_to.get("document"):
+        document = reply_to["document"]
+        name = document.get("file_name") or "file"
+        return f"[Telegram file: {name}]"
+    if reply_to.get("photo"):
+        return "[Telegram photo]"
+    if reply_to.get("video"):
+        video = reply_to["video"]
+        name = video.get("file_name") or "video"
+        return f"[Telegram video: {name}]"
+    if reply_to.get("animation"):
+        animation = reply_to["animation"]
+        name = animation.get("file_name") or "animation"
+        return f"[Telegram animation: {name}]"
+    if reply_to.get("voice"):
+        return "[Telegram voice message]"
+    if reply_to.get("audio"):
+        audio = reply_to["audio"]
+        name = audio.get("file_name") or audio.get("title") or "audio"
+        return f"[Telegram audio: {name}]"
+    if reply_to.get("video_note"):
+        return "[Telegram video message]"
+    return ""
+
+
+def _telegram_quote_snippet(message: dict[str, Any]) -> str:
+    quote = message.get("quote")
+    if isinstance(quote, dict):
+        text = (quote.get("text") or "").strip()
+        if text:
+            return _truncate_quote_snippet(text)
+    reply_to = message.get("reply_to_message")
+    if isinstance(reply_to, dict):
+        md = telegram_message_markdown(reply_to)
+        if md:
+            return _truncate_quote_snippet(md.splitlines()[0])
+        media_note = _telegram_reply_media_note(reply_to)
+        if media_note:
+            return _truncate_quote_snippet(media_note)
+    return ""
+
+
+def telegram_outgoing_with_quote(message: dict[str, Any]) -> str:
+    """Telegram outbound text with quoted parent context for MAX."""
+    body = telegram_message_markdown(message)
+    snippet = _telegram_quote_snippet(message)
+    if snippet:
+        header = f"↩️ В ответ на: «{snippet}»"
+        return f"{header}\n{body}" if body else header
+    return body

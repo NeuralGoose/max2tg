@@ -125,6 +125,22 @@ class FormattedTextTests(unittest.TestCase):
         self.assertEqual(body.text, "Ivan:\nhi")
         self.assertEqual(body.entities[0]["offset"], utf16_len("Ivan:\n"))
 
+    def test_build_delivery_includes_reply_quote(self):
+        base = FormattedText.plain("ответ")
+        body = build_delivery_formatted(
+            base,
+            [],
+            in_topic=True,
+            sender="Ivan",
+            is_channel=False,
+            attribution=None,
+            header="unused",
+            reply_quote="оригинал",
+        )
+        self.assertIn("ответ на", body.text.lower())
+        self.assertIn("оригинал", body.text)
+        self.assertIn("ответ", body.text)
+
 
 class TelegramToMaxTests(unittest.TestCase):
     def test_entities_to_markdown(self):

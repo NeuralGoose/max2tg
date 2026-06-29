@@ -1,4 +1,5 @@
 """Stage 3: typed PyMax inbound handlers on MaxToTelegramBridge."""
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,15 +117,45 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                 await bridge._on_message(_message(id=2, text="b"), client)
             client.get_user.assert_awaited_once()
 
-    async def test_edit_marks_text(self):
+    async def test_edit_mirrors_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp, telegram_mirror_edit_marker=False)
+            bridge._state.save_topic(555, thread_id=42, title="X",
+                                     chat_type="dialog")
+            client = self._client()
+            bridge._client = client
+            bridge._forward_map[("555", "1")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 10,
+                "role": "text",
+                "message_thread_id": 42,
+            }]
+            with patch(
+                "bridge.tg.edit_message_text",
+                return_value={"message_id": 10, "edit_date": 1710000000},
+            ) as edit, patch("bridge.tg.send_message", return_value=10) as send:
+                await bridge._on_message_edit(_message(text="новое"), client)
+            edit.assert_called_once()
+            self.assertEqual(
+                edit.call_args.kwargs["message_thread_id"], 42,
+            )
+            self.assertIn(("555", "1"), bridge._mirror_edit_until)
+            send.assert_not_called()
+
+    async def test_edit_unmapped_forwards_without_edit_mark(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
+            bridge._content_fingerprints[("555", "5")] = (
+                message_content_fingerprint(_message(id=5, text="old"))
+            )
             with patch("bridge.tg.create_forum_topic", return_value=42), \
                     patch("bridge.tg.send_message", return_value=10) as send:
-                await bridge._on_message_edit(_message(text="новое"), client)
-            self.assertIn("(изменено)", send.call_args.args[2])
+                await bridge._on_message_edit(_message(id=5, text="new"), client)
+            body = send.call_args.args[2]
+            self.assertIn("new", body)
+            self.assertNotIn("(изменено)", body)
 
     async def test_photo_attachment_routed_to_media_sender(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,19 +196,27 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                 await bridge._on_message(_message(text="привет"), client)
             self.assertIsNone(bridge._state.get_topic(555))
 
-    async def test_delete_posts_notice_to_topic(self):
+    async def test_mirror_delete_removes_tg_messages(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             bridge._state.save_topic(555, thread_id=42, title="X",
                                      chat_type="dialog")
             client = self._client()
             bridge._client = client
+            bridge._forward_map[("555", "1")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 10,
+                "role": "text",
+            }]
             event = SimpleNamespace(chat_id=555, message_ids=[1])
-            with patch("bridge.tg.send_message", return_value=10) as send:
+            with patch("bridge.tg.delete_message") as delete, \
+                    patch("bridge.tg.send_message") as send:
                 await bridge._on_message_delete(event, client)
-            send.assert_called_once()
-            self.assertIn("удал", send.call_args.args[2].lower())
-            self.assertEqual(send.call_args.kwargs["message_thread_id"], 42)
+            delete.assert_called_once_with(
+                "token", -100222, 10,
+            )
+            send.assert_not_called()
+            self.assertNotIn(("555", "1"), bridge._forward_map)
 
     async def test_forwarded_group_post_shows_attribution_and_text(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,18 +359,101 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                 await bridge._on_message_edit(edited, client)
             send.assert_not_called()
 
-    async def test_text_edit_still_sends(self):
+    async def test_text_edit_still_sends_when_unmapped(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
+            bridge._state.mark_delivered(555, 5)
+            bridge._hydrate_delivered_cache()
             bridge._content_fingerprints[("555", "5")] = (
                 message_content_fingerprint(_message(id=5, text="old"))
             )
             with patch("bridge.tg.create_forum_topic", return_value=42), \
                     patch("bridge.tg.send_message", return_value=10) as send:
                 await bridge._on_message_edit(_message(id=5, text="new"), client)
-            self.assertIn("(изменено)", send.call_args.args[2])
+            send.assert_called_once()
+            self.assertNotIn("(изменено)", send.call_args.args[2])
+
+    async def test_mirror_reaction_sets_tg_reaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client = self._client()
+            bridge._client = client
+            bridge._forward_map[("555", "1")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 10,
+                "role": "text",
+            }]
+            counter = SimpleNamespace(count=2, reaction="👍")
+            event = SimpleNamespace(
+                chat_id=555, message_id="1", counters=[counter], total_count=2,
+            )
+            with patch("bridge.tg.set_message_reaction") as react:
+                await bridge._on_reaction_update(event, client)
+            react.assert_called_once_with("token", -100222, 10, "👍")
+
+    async def test_mirror_reaction_skipped_after_recent_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client = self._client()
+            bridge._client = client
+            bridge._forward_map[("555", "1")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 10,
+                "role": "text",
+            }]
+            loop = asyncio.get_running_loop()
+            bridge._mirror_edit_until[("555", "1")] = loop.time() + 60
+            counter = SimpleNamespace(count=2, reaction="👍")
+            event = SimpleNamespace(
+                chat_id=555, message_id="1", counters=[counter], total_count=2,
+            )
+            with patch("bridge.tg.set_message_reaction") as react:
+                await bridge._on_reaction_update(event, client)
+            react.assert_not_called()
+
+    async def test_mirror_edit_marker_on_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            self.assertTrue(bridge._mirror_edit_marker)
+            bridge._state.save_topic(555, thread_id=42, title="X",
+                                     chat_type="dialog")
+            client = self._client()
+            bridge._client = client
+            bridge._forward_map[("555", "1")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 10,
+                "role": "text",
+                "message_thread_id": 42,
+            }]
+            with patch(
+                "bridge.tg.edit_message_text",
+                return_value={"message_id": 10, "edit_date": 1},
+            ) as edit, patch("bridge.tg.send_message"):
+                await bridge._on_message_edit(_message(text="новое"), client)
+            self.assertIn(" · ред.", edit.call_args.args[3])
+
+    async def test_mirror_edit_marker_appends_suffix_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp, telegram_mirror_edit_marker=True)
+            bridge._state.save_topic(555, thread_id=42, title="X",
+                                     chat_type="dialog")
+            client = self._client()
+            bridge._client = client
+            bridge._forward_map[("555", "1")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 10,
+                "role": "text",
+                "message_thread_id": 42,
+            }]
+            with patch(
+                "bridge.tg.edit_message_text",
+                return_value={"message_id": 10, "edit_date": 1},
+            ) as edit, patch("bridge.tg.send_message"):
+                await bridge._on_message_edit(_message(text="новое"), client)
+            body = edit.call_args.args[3]
+            self.assertIn(" · ред.", body)
 
     async def test_text_and_photo_embeds_body_in_caption(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -397,6 +519,63 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             overflow = send_msg.call_args.args[2]
             self.assertTrue(overflow)
             self.assertIn("A", overflow)
+
+    async def test_reply_link_includes_quote_in_telegram_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client = self._client()
+            bridge._client = client
+            msg = _message(
+                text="мой ответ",
+                model_extra={
+                    "link": {
+                        "type": "REPLY",
+                        "message": {"text": "оригинал"},
+                    },
+                },
+            )
+            with patch("bridge.tg.create_forum_topic", return_value=42), \
+                    patch("bridge.tg.send_message", return_value=10) as send:
+                await bridge._on_message(msg, client)
+
+            body = send.call_args.args[2]
+            self.assertIn("мой ответ", body)
+            self.assertIn("оригинал", body)
+            self.assertIn("ответ на", body.lower())
+
+    async def test_reply_uses_native_reply_parameters_when_parent_mapped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client = self._client()
+            bridge._client = client
+            bridge._forward_map[("555", "100")] = [{
+                "telegram_chat_id": -100222,
+                "message_id": 50,
+                "role": "text",
+                "message_thread_id": 42,
+            }]
+            msg = _message(
+                id=200,
+                text="мой ответ",
+                model_extra={
+                    "link": {
+                        "type": "REPLY",
+                        "messageId": 100,
+                        "message": {"text": "оригинал"},
+                    },
+                },
+            )
+            with patch("bridge.tg.create_forum_topic", return_value=42), \
+                    patch("bridge.tg.send_message", return_value=10) as send:
+                await bridge._on_message(msg, client)
+
+            reply_params = send.call_args.kwargs.get("reply_parameters")
+            self.assertIsNotNone(reply_params)
+            self.assertEqual(reply_params["message_id"], 50)
+            self.assertEqual(reply_params["quote"], "оригинал")
+            body = send.call_args.args[2]
+            self.assertIn("мой ответ", body)
+            self.assertNotIn("оригинал", body)
 
 
 if __name__ == "__main__":

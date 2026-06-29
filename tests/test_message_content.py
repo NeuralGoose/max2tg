@@ -200,6 +200,82 @@ class ResolveMessageContentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.author, UNKNOWN_SENDER)
         self.assertFalse(resolved.is_forward)
 
+    async def test_reply_with_own_text_includes_quote(self):
+        wrapper = _message(
+            text="мой ответ",
+            model_extra={
+                "link": {
+                    "type": "REPLY",
+                    "message": {"text": "оригинал"},
+                },
+            },
+        )
+        client = Mock()
+
+        resolved = await resolve_message_content(
+            wrapper,
+            client,
+            chat_type="chat",
+            chat_title="Группа",
+            own_id=999,
+            resolve_sender_name=AsyncMock(return_value="Автор"),
+        )
+
+        self.assertTrue(resolved.is_reply)
+        self.assertEqual(resolved.text, "мой ответ")
+        self.assertEqual(resolved.reply_quote, "оригинал")
+        self.assertIsNone(resolved.attribution)
+
+    async def test_reply_only_unwraps_inner_message(self):
+        wrapper = _message(
+            model_extra={
+                "link": {
+                    "type": "REPLY",
+                    "message": {"text": "только цитата"},
+                },
+            },
+        )
+        client = Mock()
+
+        resolved = await resolve_message_content(
+            wrapper,
+            client,
+            chat_type="chat",
+            chat_title="Группа",
+            own_id=999,
+            resolve_sender_name=AsyncMock(return_value="Автор"),
+        )
+
+        self.assertTrue(resolved.is_reply)
+        self.assertIn("только цитата", resolved.text)
+        self.assertIn("ответ на", resolved.text.lower())
+        self.assertIsNone(resolved.reply_quote)
+
+    async def test_reply_snippet_truncated_at_120_chars(self):
+        long_text = "а" * 150
+        wrapper = _message(
+            text="короткий ответ",
+            model_extra={
+                "link": {
+                    "type": "REPLY",
+                    "message": {"text": long_text},
+                },
+            },
+        )
+        client = Mock()
+
+        resolved = await resolve_message_content(
+            wrapper,
+            client,
+            chat_type="chat",
+            chat_title="Группа",
+            own_id=999,
+            resolve_sender_name=AsyncMock(return_value="Автор"),
+        )
+
+        self.assertLessEqual(len(resolved.reply_quote or ""), 120)
+        self.assertTrue((resolved.reply_quote or "").endswith("…"))
+
 
 class FingerprintTests(unittest.TestCase):
     def test_same_text_and_attaches_same_fingerprint(self):

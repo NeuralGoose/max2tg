@@ -280,11 +280,87 @@ def set_my_commands(token: str, commands: list[dict]) -> None:
     _call(token, "setMyCommands", commands=commands)
 
 
+def get_me(token: str) -> dict:
+    return _call(token, "getMe")
+
+
 def get_updates(token: str, offset: int | None = None, timeout: int = 25) -> list[dict]:
-    params = {"timeout": timeout, "allowed_updates": ["message"]}
+    params = {
+        "timeout": timeout,
+        "allowed_updates": ["message", "edited_message", "message_reaction"],
+    }
     if offset is not None:
         params["offset"] = offset
     return _call(token, "getUpdates", **params)
+
+
+def edit_message_text(
+    token: str,
+    chat_id: int | str,
+    message_id: int,
+    text: str,
+    *,
+    message_thread_id: int | None = None,
+    entities: list[dict] | None = None,
+) -> dict | None:
+    params: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if message_thread_id:
+        params["message_thread_id"] = message_thread_id
+    if entities:
+        params["entities"] = entities
+    return _call_with_entity_fallback(token, "editMessageText", params)
+
+
+def edit_message_caption(
+    token: str,
+    chat_id: int | str,
+    message_id: int,
+    caption: str,
+    *,
+    message_thread_id: int | None = None,
+    caption_entities: list[dict] | None = None,
+) -> dict | None:
+    caption, caption_entities = _prepare_caption(caption, caption_entities)
+    if not caption:
+        return None
+    params: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "caption": caption,
+    }
+    if message_thread_id:
+        params["message_thread_id"] = message_thread_id
+    if caption_entities:
+        params["caption_entities"] = caption_entities
+    return _call_with_entity_fallback(token, "editMessageCaption", params)
+
+
+def delete_message(
+    token: str,
+    chat_id: int | str,
+    message_id: int,
+) -> None:
+    _call(token, "deleteMessage", chat_id=chat_id, message_id=message_id)
+
+
+def set_message_reaction(
+    token: str,
+    chat_id: int | str,
+    message_id: int,
+    reaction: str | None,
+) -> None:
+    """Set or clear the bot's reaction on a message."""
+    params: dict = {"chat_id": chat_id, "message_id": message_id}
+    if reaction:
+        params["reaction"] = [{"type": "emoji", "emoji": reaction}]
+    else:
+        params["reaction"] = []
+    _call(token, "setMessageReaction", **params)
 
 
 def get_file(token: str, file_id: str) -> dict:
@@ -426,7 +502,8 @@ def _prepare_caption(
 def send_message(token: str, chat_id: int | str, text: str,
                  reply_to_message_id: int | None = None,
                  message_thread_id: int | None = None,
-                 entities: list[dict] | None = None) -> int | None:
+                 entities: list[dict] | None = None,
+                 reply_parameters: dict | None = None) -> int | None:
     """Send text, splitting over Telegram's UTF-16 length limit.
 
     Returns the message_id of the first chunk (used for reply mapping).
@@ -441,10 +518,12 @@ def send_message(token: str, chat_id: int | str, text: str,
             entity_list, chunk_start, chunk_len,
         ) or None
         params = {"chat_id": chat_id, "text": chunk_text,
-                  "disable_web_page_preview": True}
+                  "link_preview_options": {"is_disabled": True}}
         if message_thread_id:
             params["message_thread_id"] = message_thread_id
-        if reply_to_message_id and first_id is None:
+        if reply_parameters and first_id is None:
+            params["reply_parameters"] = reply_parameters
+        elif reply_to_message_id and first_id is None:
             params["reply_to_message_id"] = reply_to_message_id
         if chunk_entities:
             params["entities"] = chunk_entities

@@ -303,7 +303,7 @@ class SeedChatMessagesTests(unittest.IsolatedAsyncioTestCase):
                     new=AsyncMock(return_value=(True, 50, True)),
                 ) as deliver:
                     await bridge._handle_incoming_message(
-                        live_message, client, edited=False,
+                        live_message, client,
                     )
                     return deliver
 

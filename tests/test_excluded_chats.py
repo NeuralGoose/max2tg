@@ -65,14 +65,14 @@ class ExcludedChatBridgeTests(unittest.IsolatedAsyncioTestCase):
         bridge = self._bridge()
         message = _message("m1", text="welcome.saved.dialog.message", chat_id=100)
         with patch.object(bridge, "_forward", new=AsyncMock(return_value=True)) as forward:
-            await bridge._handle_incoming_message(message, Mock(), edited=False)
+            await bridge._handle_incoming_message(message, Mock())
         forward.assert_not_called()
 
     async def test_excluded_chat_live_message_ignored(self):
         bridge = self._bridge()
         message = _message("m1", text="secret note", chat_id=0)
         with patch.object(bridge, "_forward", new=AsyncMock(return_value=True)) as forward:
-            await bridge._handle_incoming_message(message, Mock(), edited=False)
+            await bridge._handle_incoming_message(message, Mock())
         forward.assert_not_called()
 
     async def test_locale_system_text_not_seeded(self):
