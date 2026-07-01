@@ -204,6 +204,55 @@ class BridgeState:
             self._data["topics"][str(max_chat_id)] = topic
             self.save()
 
+    def record_message_mirror(
+        self,
+        max_chat_id: int | str,
+        max_message_id: int | str,
+        *,
+        telegram_chat_id,
+        telegram_message_id: int,
+        message_thread_id: int | None = None,
+        role: str,
+    ) -> None:
+        topic = self.get_topic(max_chat_id)
+        if not topic:
+            return
+        mirrors = topic.setdefault("message_mirrors", {})
+        mid = str(max_message_id)
+        entries = mirrors.setdefault(mid, [])
+        for entry in entries:
+            if entry.get("telegram_message_id") == telegram_message_id:
+                return
+        entries.append({
+            "telegram_chat_id": telegram_chat_id,
+            "telegram_message_id": telegram_message_id,
+            "message_thread_id": message_thread_id,
+            "role": role,
+        })
+        mirror_ids = list(mirrors.keys())
+        if len(mirror_ids) > DELIVERED_IDS_LIMIT:
+            for old_mid in mirror_ids[: len(mirror_ids) - DELIVERED_IDS_LIMIT]:
+                mirrors.pop(old_mid, None)
+        topic["message_mirrors"] = mirrors
+        self._data["topics"][str(max_chat_id)] = topic
+        self.save()
+
+    def iter_message_mirrors(
+        self,
+    ) -> list[tuple[str, str, list[dict[str, Any]]]]:
+        """(max_chat_id, max_message_id, mirror entries) for all topics."""
+        out: list[tuple[str, str, list[dict[str, Any]]]] = []
+        for chat_id, topic in self._data.get("topics", {}).items():
+            if not isinstance(topic, dict):
+                continue
+            mirrors = topic.get("message_mirrors") or {}
+            if not isinstance(mirrors, dict):
+                continue
+            for max_mid, entries in mirrors.items():
+                if isinstance(entries, list) and entries:
+                    out.append((str(chat_id), str(max_mid), entries))
+        return out
+
     def find_by_thread(self, thread_id: int) -> dict[str, Any] | None:
         for topic in self._data["topics"].values():
             if isinstance(topic, dict) and topic.get("telegram_thread_id") == thread_id:

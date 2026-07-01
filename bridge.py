@@ -8,6 +8,7 @@ import asyncio
 import logging
 import re
 from collections import OrderedDict
+from pathlib import Path
 
 import attaches
 import maxactions
@@ -19,27 +20,26 @@ from formatting import (
     FormattedText,
     build_delivery_formatted,
     telegram_message_markdown,
-    telegram_outgoing_with_quote,
 )
 from max_client import build_max_client
 from maxauth import TelegramAuthPoll
+from message_links import MessageLink, MessageLinkRegistry, default_links_db_path
+from message_sync import (
+    EditResolveResult,
+    MaxEventKind,
+    MaxToTgEditDeps,
+    MessageSync,
+    SyncConfig,
+)
 from state import BridgeState, normalize_topic_title
 
 _logger = logging.getLogger(__name__)
 
 RECONNECT_DELAY_SECONDS = 15
 RECONNECT_MAX_DELAY = 300
-REPLY_MAP_LIMIT = 10000
-FORWARD_MAP_LIMIT = 10000
-TG_SENT_MAP_LIMIT = 10000
-# Skip reaction mirroring briefly after a text/caption edit on the same MAX
-# message so set_message_reaction does not clear Telegram's edit_date badge.
-REACTION_AFTER_EDIT_GUARD_SECONDS = 2.0
-MIRROR_EDIT_MARKER = " · ред."
 NAME_CACHE_LIMIT = 5000
-# Bound the edit-dedup fingerprint map and the per-chat topic-lock map so a
-# long-running bridge over many chats does not grow them without limit.
-CONTENT_FP_LIMIT = 10000
+# Bound the per-chat topic-lock map so a long-running bridge over many chats
+# does not grow it without limit.
 TOPIC_LOCK_LIMIT = 5000
 # Cap concurrent inbound-message handlers so a media burst can't exhaust the
 # asyncio to_thread pool and starve the Telegram long-poll.
@@ -112,22 +112,20 @@ class MaxToTelegramBridge:
         self._mark_read_on_forward = bool(
             config.get("max_mark_read_on_telegram_forward", False),
         )
+        self._mirror_reaction_debug = bool(
+            config.get("telegram_mirror_reaction_debug", False),
+        )
         self._own_id: int | None = None
         # Bounded LRU so a long-running process can't grow the cache forever.
         self._name_cache: "OrderedDict[int, str]" = OrderedDict()
         # The active PyMax client (WebClient or Client), set once started.
         self._client = None
         self._state = BridgeState()
-        # telegram message_id -> {"chat_id", "message_id", "sender"}
-        self._reply_map: "OrderedDict[int, dict]" = OrderedDict()
-        # (max_chat_id, max_message_id) -> [{telegram_chat_id, message_id, role}]
-        self._forward_map: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
-        # outbound TG message_id -> {max_chat_id, max_message_id}
-        self._tg_sent_to_max: "OrderedDict[int, dict]" = OrderedDict()
+        links_path = config.get("links_db_path") or default_links_db_path(
+            self._state.path,
+        )
+        self._links = MessageLinkRegistry(Path(links_path) if links_path else None)
         self._bot_id: int | None = None
-        # (max_chat_id, max_message_id) -> monotonic deadline: skip reaction mirror
-        self._mirror_edit_until: "dict[tuple[str, str], float]" = {}
-        self._mirrored_reactions: "dict[tuple[str, str], str | None]" = {}
         # Per-MAX-chat locks serialize topic creation so two concurrent messages
         # from a brand-new chat cannot create duplicate Telegram topics.
         self._topic_locks: "dict[str, asyncio.Lock]" = {}
@@ -139,14 +137,89 @@ class MaxToTelegramBridge:
         self._tg_poll_task: "asyncio.Task | None" = None
         # Hot cache of (max_chat_id, max_message_id) already sent to Telegram.
         self._delivered_cache: set[tuple[str, str]] = set()
-        # Last seen content fingerprint per message (for stats-only edit skip).
-        self._content_fingerprints: "OrderedDict[tuple[str, str], str]" = OrderedDict()
         self._excluded_chat_ids = frozenset(
             self._config.get("telegram_exclude_chat_ids") or {0},
         )
         self._forum_icon_sticker_ids_cache: list[str] | None = None
         tg.set_api_min_interval(
             float(config.get("telegram_api_min_interval_seconds") or 0.05),
+        )
+        self._init_message_sync()
+
+    def _init_message_sync(self) -> None:
+        delays = self._config.get("sync_reaction_poll_delays") or (2, 15, 60, 300)
+        sync_cfg = SyncConfig(
+            mirror_edit_marker=self._mirror_edit_marker,
+            sync_debug=bool(
+                self._config.get("sync_debug")
+                or self._mirror_reaction_debug
+            ),
+            poll_delays=tuple(int(d) for d in delays),
+            watch_ttl=int(self._config.get("sync_reaction_watch_ttl") or 86400),
+            coalesce_seconds=float(
+                self._config.get("sync_reaction_coalesce_seconds") or 0.5
+            ),
+            events_log=Path(__file__).parent / "events.log",
+        )
+        edit_deps = MaxToTgEditDeps(
+            token=self._token,
+            links=self._links,
+            mirror_edit_marker=self._mirror_edit_marker,
+            split_caption=self._split_caption,
+            entry_thread_id=self._entry_thread_id,
+            topic_lock=self._topic_lock,
+            telegram_target=self._telegram_target,
+            resolve_for_edit=self._resolve_for_edit,
+            is_locale_system_text=self._is_locale_system_text,
+            reply_parameters_for_max=self._reply_parameters_for_max,
+            is_channel_chat=self._is_channel_chat,
+            media_senders=frozenset(_MEDIA_SENDERS.keys()),
+            attaches_parse=attaches.parse,
+        )
+        self._sync = MessageSync(
+            links=self._links,
+            token=self._token,
+            config=sync_cfg,
+            edit_deps=edit_deps,
+            get_client=lambda: self._client,
+            bot_id=lambda: self._bot_id,
+        )
+        self._sync.set_delivered_discard(
+            lambda c, m: self._delivered_cache.discard((c, m)),
+        )
+
+    def _on_link_created(self, link: MessageLink | None) -> None:
+        if link is not None:
+            self._sync.on_link_created(link)
+
+    async def _resolve_for_edit(self, message, client) -> EditResolveResult:
+        sender_id = getattr(message, "sender", None)
+        chat_id = getattr(message, "chat_id", None)
+        sender_hint = await self._message_sender_name(client, sender_id)
+        chat_title, chat_type = await self._chat_meta(
+            client, chat_id, sender_hint,
+        )
+        resolved = await message_content.resolve_message_content(
+            message,
+            client,
+            chat_type=chat_type,
+            chat_title=chat_title,
+            own_id=self._own_id,
+            resolve_sender_name=lambda uid: self._resolve_sender_name(
+                client, uid,
+            ),
+        )
+        return EditResolveResult(
+            resolved=resolved,
+            chat_title=chat_title,
+            chat_type=chat_type,
+        )
+
+    def _is_channel_chat(self, chat_id, chat_type: str, in_topic: bool) -> bool:
+        topic = self._state.get_topic(chat_id) if in_topic else None
+        return (
+            chat_type == "channel"
+            or bool(topic and topic.get("chat_type") == "channel")
         )
 
     # --- helpers -------------------------------------------------------------
@@ -165,8 +238,27 @@ class MaxToTelegramBridge:
         for chat_id, ids in self._state.delivered_no_topic_map().items():
             for mid in ids:
                 self._delivered_cache.add((str(chat_id), str(mid)))
+        self._hydrate_message_links()
+
+    def _hydrate_message_links(self) -> None:
+        count = self._links.hydrate()
+        if count == 0:
+            imported = self._links.import_json_mirrors(
+                self._state.iter_message_mirrors(),
+                default_telegram_chat_id=(
+                    self._forum_chat_id or self._fallback_chat_id
+                ),
+            )
+            if imported:
+                _logger.info(
+                    "Imported %d message link(s) from state.json into links.db",
+                    imported,
+                )
+
 
     def _is_delivered(self, chat_id, message_id) -> bool:
+        if self._links.is_max_linked(chat_id, message_id):
+            return True
         key = (str(chat_id), str(message_id))
         if key in self._delivered_cache:
             return True
@@ -264,24 +356,29 @@ class MaxToTelegramBridge:
     def _remember(self, tg_message_id: int | None, max_chat_id, max_message_id,
                   sender: str, telegram_chat_id=None,
                   message_thread_id: int | None = None, *,
-                  forward_role: str | None = "text") -> None:
+                  forward_role: str | None = "text",
+                  link_source: str = "live") -> None:
         if not tg_message_id:
             return
-        self._reply_map[tg_message_id] = {
-            "chat_id": max_chat_id,
-            "message_id": max_message_id,
-            "sender": sender,
-            "telegram_chat_id": telegram_chat_id or self._fallback_chat_id,
-            "message_thread_id": message_thread_id,
-        }
-        while len(self._reply_map) > REPLY_MAP_LIMIT:
-            self._reply_map.popitem(last=False)
+        tg_chat = telegram_chat_id or self._fallback_chat_id
         if forward_role:
             self._remember_forward(
                 max_chat_id, max_message_id,
-                telegram_chat_id or self._fallback_chat_id,
-                tg_message_id, forward_role, message_thread_id,
+                tg_chat, tg_message_id, forward_role, message_thread_id,
+                link_source=link_source, sender=sender,
             )
+        else:
+            link = self._links.link(
+                max_chat_id, max_message_id,
+                telegram_chat_id=tg_chat,
+                telegram_message_id=tg_message_id,
+                message_thread_id=message_thread_id,
+                role="text",
+                origin="max_to_tg",
+                source=link_source,
+                sender=sender,
+            )
+            self._on_link_created(link)
 
     def _remember_forward(
         self,
@@ -291,18 +388,22 @@ class MaxToTelegramBridge:
         tg_message_id: int,
         role: str,
         message_thread_id: int | None = None,
+        *,
+        link_source: str = "live",
+        sender: str | None = None,
     ) -> None:
-        key = (str(max_chat_id), str(max_message_id))
-        entries = self._forward_map.setdefault(key, [])
-        entries.append({
-            "telegram_chat_id": telegram_chat_id,
-            "message_id": tg_message_id,
-            "role": role,
-            "message_thread_id": message_thread_id,
-        })
-        self._forward_map.move_to_end(key)
-        while len(self._forward_map) > FORWARD_MAP_LIMIT:
-            self._forward_map.popitem(last=False)
+        link = self._links.link(
+            max_chat_id,
+            max_message_id,
+            telegram_chat_id=telegram_chat_id,
+            telegram_message_id=tg_message_id,
+            message_thread_id=message_thread_id,
+            role=role,
+            origin="max_to_tg",
+            source=link_source,
+            sender=sender,
+        )
+        self._on_link_created(link)
 
     def _reply_parameters_for_max(
         self,
@@ -313,11 +414,12 @@ class MaxToTelegramBridge:
         """Native Telegram reply when the parent MAX message was forwarded."""
         if reply_parent_max_id is None:
             return None
-        key = (str(max_chat_id), str(reply_parent_max_id))
-        entries = self._forward_map.get(key)
-        if not entries:
+        tg_id = self._links.tg_message_id_for_max_parent(
+            max_chat_id, reply_parent_max_id,
+        )
+        if tg_id is None:
             return None
-        params: dict = {"message_id": entries[0]["message_id"]}
+        params: dict = {"message_id": tg_id}
         if reply_quote:
             params["quote"] = reply_quote
         return params
@@ -327,29 +429,28 @@ class MaxToTelegramBridge:
         tg_message_id: int | None,
         max_chat_id,
         max_message_id,
+        *,
+        telegram_chat_id=None,
+        message_thread_id: int | None = None,
     ) -> None:
         if not tg_message_id or max_message_id is None:
             return
-        self._tg_sent_to_max[tg_message_id] = {
-            "max_chat_id": max_chat_id,
-            "max_message_id": max_message_id,
-        }
-        while len(self._tg_sent_to_max) > TG_SENT_MAP_LIMIT:
-            self._tg_sent_to_max.popitem(last=False)
+        link = self._links.link(
+            max_chat_id,
+            max_message_id,
+            telegram_chat_id=(
+                telegram_chat_id or self._forum_chat_id or self._fallback_chat_id
+            ),
+            telegram_message_id=tg_message_id,
+            message_thread_id=message_thread_id,
+            role="text",
+            origin="tg_to_max",
+            source="live",
+        )
+        self._on_link_created(link)
 
     def _lookup_max_message(self, tg_message_id: int | None) -> dict | None:
-        if not tg_message_id:
-            return None
-        sent = self._tg_sent_to_max.get(tg_message_id)
-        if sent:
-            return sent
-        reply = self._reply_map.get(tg_message_id)
-        if reply and reply.get("message_id") is not None:
-            return {
-                "max_chat_id": reply["chat_id"],
-                "max_message_id": reply["message_id"],
-            }
-        return None
+        return self._links.max_target_for_tg(tg_message_id)
 
     @staticmethod
     def _display_name(user) -> str | None:
@@ -775,12 +876,6 @@ class MaxToTelegramBridge:
             if existing is not None and not existing.locked():
                 del self._topic_locks[k]
 
-    def _set_content_fingerprint(self, key: tuple[str, str], fp: str) -> None:
-        self._content_fingerprints[key] = fp
-        self._content_fingerprints.move_to_end(key)
-        while len(self._content_fingerprints) > CONTENT_FP_LIMIT:
-            self._content_fingerprints.popitem(last=False)
-
     def _existing_topic_target(self, max_chat_id, title, chat_type, sender):
         existing = self._state.get_topic(max_chat_id)
         if not (existing and existing.get("telegram_thread_id")):
@@ -1029,6 +1124,7 @@ class MaxToTelegramBridge:
             attribution=resolved.attribution,
             reply_quote=text_reply_quote,
             reply_parameters=reply_parameters,
+            link_source="seed",
         )
         if not delivered:
             return False
@@ -1116,6 +1212,7 @@ class MaxToTelegramBridge:
         attribution: str | None = None,
         reply_quote: str | None = None,
         reply_parameters: dict | None = None,
+        link_source: str = "live",
     ) -> tuple[bool, int | None, bool]:
         """Forward parsed MAX content to Telegram.
 
@@ -1154,7 +1251,7 @@ class MaxToTelegramBridge:
 
         ctx = (
             client, header, chat_id, max_message_id, sender,
-            telegram_chat_id, thread_id, in_topic, is_channel,
+            telegram_chat_id, thread_id, in_topic, is_channel, link_source,
         )
         delivered = False
         fully_delivered = True
@@ -1181,6 +1278,7 @@ class MaxToTelegramBridge:
                 self._remember(
                     msg_id, chat_id, max_message_id, sender,
                     telegram_chat_id, thread_id,
+                    link_source=link_source,
                 )
                 reply_mapped = True
                 delivered = True
@@ -1224,6 +1322,7 @@ class MaxToTelegramBridge:
                             self._remember_forward(
                                 chat_id, max_message_id, telegram_chat_id,
                                 mid, role, thread_id,
+                                link_source=link_source,
                             )
                         if not reply_mapped:
                             first_msg_id = ids[0]
@@ -1231,6 +1330,7 @@ class MaxToTelegramBridge:
                                 ids[0], chat_id, max_message_id, sender,
                                 telegram_chat_id, thread_id,
                                 forward_role=None,
+                                link_source=link_source,
                             )
                             reply_mapped = True
                     else:
@@ -1310,6 +1410,7 @@ class MaxToTelegramBridge:
                     self._remember(
                         overflow_id, chat_id, max_message_id, sender,
                         telegram_chat_id, thread_id,
+                        link_source=link_source,
                     )
                     reply_mapped = True
             else:
@@ -1337,6 +1438,7 @@ class MaxToTelegramBridge:
                 self._remember(
                     msg_id, chat_id, max_message_id, sender,
                     telegram_chat_id, thread_id,
+                    link_source=link_source,
                 )
                 delivered = True
             else:
@@ -1408,7 +1510,7 @@ class MaxToTelegramBridge:
         caption_override: FormattedText | None,
     ) -> FormattedText | None:
         (_client, header, _chat_id, _max_message_id, sender, _telegram_chat_id,
-         _thread_id, in_topic, is_channel) = ctx
+         _thread_id, in_topic, is_channel, _link_source) = ctx
         if caption_override is not None:
             return caption_override
         if body_placed:
@@ -1432,7 +1534,7 @@ class MaxToTelegramBridge:
         real media could not be sent and only a failure note was posted, so the
         caller can avoid marking the MAX message fully delivered."""
         (_client, header, chat_id, max_message_id, sender, telegram_chat_id,
-         thread_id, in_topic, is_channel) = ctx
+         thread_id, in_topic, is_channel, link_source) = ctx
         caption_fmt = self._media_item_caption(
             item, body_placed, ctx, caption_override=caption_override,
         )
@@ -1462,6 +1564,7 @@ class MaxToTelegramBridge:
                 msg_id, chat_id, max_message_id, sender,
                 telegram_chat_id, thread_id,
                 forward_role=forward_role,
+                link_source=link_source,
             )
         return True, msg_id, ok
 
@@ -1480,7 +1583,7 @@ class MaxToTelegramBridge:
         as ok (a retry would not help); only a resolve/send exception sets ok to
         False so the caller can retry the MAX message on the next run."""
         (client, header, chat_id, max_message_id, sender, telegram_chat_id,
-         thread_id, in_topic, is_channel) = ctx
+         thread_id, in_topic, is_channel, link_source) = ctx
         caption_fmt = self._media_item_caption(
             item, body_placed, ctx, caption_override=caption_override,
         )
@@ -1497,8 +1600,11 @@ class MaxToTelegramBridge:
                 tg.send_message, self._token, telegram_chat_id, note,
                 message_thread_id=thread_id)
             if remember and msg_id:
-                self._remember(msg_id, chat_id, max_message_id, sender,
-                               telegram_chat_id, thread_id)
+                self._remember(
+                    msg_id, chat_id, max_message_id, sender,
+                    telegram_chat_id, thread_id,
+                    link_source=link_source,
+                )
             return True, msg_id, True
         ok = True
         try:
@@ -1528,6 +1634,7 @@ class MaxToTelegramBridge:
                 msg_id, chat_id, max_message_id, sender,
                 telegram_chat_id, thread_id,
                 forward_role=forward_role,
+                link_source=link_source,
             )
         return True, msg_id, ok
 
@@ -1557,6 +1664,9 @@ class MaxToTelegramBridge:
                 if (not _allow_redeliver and chat_id is not None
                         and max_message_id is not None):
                     if self._is_delivered(chat_id, max_message_id):
+                        await self._sync.on_max_delivered_redelivery(
+                            message, client,
+                        )
                         return
 
                 sender_hint = await self._message_sender_name(client, sender_id)
@@ -1649,11 +1759,6 @@ class MaxToTelegramBridge:
             _logger.exception("Retry after stale topic failed for chat %s",
                               chat_id)
 
-    def _mirror_edit_delivery_fmt(self, body_fmt: FormattedText) -> FormattedText:
-        if not self._mirror_edit_marker:
-            return body_fmt
-        return body_fmt.append_plain_suffix(MIRROR_EDIT_MARKER)
-
     @staticmethod
     def _entry_thread_id(entry: dict, fallback: int | None) -> int | None:
         stored = entry.get("message_thread_id")
@@ -1661,219 +1766,24 @@ class MaxToTelegramBridge:
             return stored
         return fallback
 
-    def _log_mirror_edit_result(
-        self, role: str, tg_message_id: int, result: dict | None,
-    ) -> None:
-        if not result:
-            return
-        edit_date = result.get("edit_date")
-        _logger.info(
-            "Mirrored MAX edit to Telegram %s msg %s (edit_date=%s)",
-            role, tg_message_id, edit_date,
-        )
-        if edit_date:
-            if self._mirror_edit_marker:
-                _logger.debug(
-                    "Appended visible edit marker to msg %s — Telegram "
-                    "clients often omit the native badge on bot forum posts "
-                    "even when edit_date is set",
-                    tg_message_id,
-                )
-            else:
-                _logger.info(
-                    "Native edited badge may not appear on bot forum posts "
-                    "(edit_date=%s); set telegram_mirror_edit_marker=true "
-                    "for a visible suffix",
-                    edit_date,
-                )
-        elif not edit_date:
-            _logger.warning(
-                "Telegram edit returned no edit_date for msg %s — "
-                "edited badge may not appear in clients",
-                tg_message_id,
-            )
-
-    def _mark_mirror_edit_guard(self, key: tuple[str, str]) -> None:
-        loop = asyncio.get_running_loop()
-        self._mirror_edit_until[key] = (
-            loop.time() + REACTION_AFTER_EDIT_GUARD_SECONDS
-        )
-
-    async def _mirror_edit(self, message, client) -> None:
-        """Edit mapped Telegram messages in place (text/caption only).
-
-        Attachment-only edits or media replacement are not mirrored."""
-        chat_id = getattr(message, "chat_id", None)
-        max_message_id = getattr(message, "id", None)
-        if chat_id is None or max_message_id is None:
-            return
-        key = (str(chat_id), str(max_message_id))
-        entries = self._forward_map.get(key)
-        if not entries:
-            return
-        try:
-            sender_id = getattr(message, "sender", None)
-            sender_hint = await self._message_sender_name(client, sender_id)
-            chat_title, chat_type = await self._chat_meta(
-                client, chat_id, sender_hint)
-            resolved = await message_content.resolve_message_content(
-                message,
-                client,
-                chat_type=chat_type,
-                chat_title=chat_title,
-                own_id=self._own_id,
-                resolve_sender_name=lambda uid: self._resolve_sender_name(
-                    client, uid),
-            )
-            message_formatted = FormattedText.from_max(
-                resolved.text, resolved.elements,
-            )
-            if self._is_locale_system_text(resolved.text):
-                return
-            parsed = attaches.parse(message_content.content_message(resolved))
-            resolvable = {"file_resolve", "video_resolve"}
-            notes = [
-                p.text for p in parsed
-                if p.kind not in _MEDIA_SENDERS and p.kind not in resolvable
-            ]
-            sender = resolved.author
-            header = f"MAX | {sender} (чат {chat_id})"
-            async with self._topic_lock(chat_id):
-                telegram_chat_id, thread_id, in_topic = await self._telegram_target(
-                    chat_id, chat_title, chat_type, sender, _lock_held=True,
-                )
-                topic = self._state.get_topic(chat_id) if in_topic else None
-                is_channel = (chat_type == "channel"
-                              or bool(topic and topic.get("chat_type") == "channel"))
-                reply_parameters = self._reply_parameters_for_max(
-                    chat_id,
-                    resolved.reply_parent_max_id,
-                    resolved.reply_quote,
-                )
-                text_reply_quote = (
-                    None if reply_parameters and resolved.reply_quote
-                    else resolved.reply_quote
-                )
-                body_fmt = build_delivery_formatted(
-                    message_formatted,
-                    notes,
-                    in_topic=in_topic,
-                    sender=sender,
-                    is_channel=is_channel,
-                    attribution=resolved.attribution,
-                    header=header,
-                    reply_quote=text_reply_quote,
-                )
-                body_fmt = self._mirror_edit_delivery_fmt(body_fmt)
-            caption_entries = [e for e in entries if e["role"] == "caption"]
-            text_entries = [e for e in entries if e["role"] == "text"]
-            edited_any = False
-            if caption_entries:
-                cap_fmt, overflow_fmt = self._split_caption(body_fmt)
-                for entry in caption_entries:
-                    try:
-                        result = await asyncio.to_thread(
-                            tg.edit_message_caption,
-                            self._token,
-                            entry["telegram_chat_id"],
-                            entry["message_id"],
-                            cap_fmt.text,
-                            message_thread_id=self._entry_thread_id(
-                                entry, thread_id,
-                            ),
-                            caption_entities=cap_fmt.entities or None,
-                        )
-                        self._log_mirror_edit_result(
-                            "caption", entry["message_id"], result,
-                        )
-                        if result:
-                            edited_any = True
-                    except Exception as exc:
-                        _logger.warning(
-                            "Failed to mirror MAX edit to Telegram caption "
-                            "msg %s: %s", entry["message_id"], exc,
-                        )
-                overflow = overflow_fmt if overflow_fmt and overflow_fmt.text else None
-                for entry in text_entries:
-                    fmt = overflow or body_fmt
-                    try:
-                        result = await asyncio.to_thread(
-                            tg.edit_message_text,
-                            self._token,
-                            entry["telegram_chat_id"],
-                            entry["message_id"],
-                            fmt.text,
-                            message_thread_id=self._entry_thread_id(
-                                entry, thread_id,
-                            ),
-                            entities=fmt.entities or None,
-                        )
-                        self._log_mirror_edit_result(
-                            "text", entry["message_id"], result,
-                        )
-                        if result:
-                            edited_any = True
-                    except Exception as exc:
-                        _logger.warning(
-                            "Failed to mirror MAX edit to Telegram text "
-                            "msg %s: %s", entry["message_id"], exc,
-                        )
-            elif text_entries:
-                for entry in text_entries:
-                    try:
-                        result = await asyncio.to_thread(
-                            tg.edit_message_text,
-                            self._token,
-                            entry["telegram_chat_id"],
-                            entry["message_id"],
-                            body_fmt.text,
-                            message_thread_id=self._entry_thread_id(
-                                entry, thread_id,
-                            ),
-                            entities=body_fmt.entities or None,
-                        )
-                        self._log_mirror_edit_result(
-                            "text", entry["message_id"], result,
-                        )
-                        if result:
-                            edited_any = True
-                    except Exception as exc:
-                        _logger.warning(
-                            "Failed to mirror MAX edit to Telegram text "
-                            "msg %s: %s", entry["message_id"], exc,
-                        )
-            if edited_any:
-                self._mark_mirror_edit_guard(key)
-        except Exception:
-            _logger.exception(
-                "Failed to mirror MAX edit for chat %s msg %s",
-                chat_id, max_message_id,
-            )
-
     async def _on_message(self, message, client) -> None:
-        chat_id = getattr(message, "chat_id", None)
-        message_id = getattr(message, "id", None)
-        if chat_id is not None and message_id is not None:
-            key = (str(chat_id), str(message_id))
-            self._set_content_fingerprint(
-                key, message_content.message_content_fingerprint(message))
+        await self._sync.on_max_message(message, client)
         await self._handle_incoming_message(message, client)
 
     async def _on_message_edit(self, message, client) -> None:
         if client is not self._client:
             return
-        chat_id = getattr(message, "chat_id", None)
-        message_id = getattr(message, "id", None)
-        if chat_id is not None and message_id is not None:
-            key = (str(chat_id), str(message_id))
-            fp = message_content.message_content_fingerprint(message)
-            if self._content_fingerprints.get(key) == fp:
+        kind = await self._sync.on_max_message_edit(message, client)
+        if kind == MaxEventKind.STATS_ONLY:
+            return
+        if kind == MaxEventKind.REACTION_ONLY:
+            return
+        if kind == MaxEventKind.CONTENT_EDIT:
+            chat_id = getattr(message, "chat_id", None)
+            message_id = getattr(message, "id", None)
+            if (chat_id is not None and message_id is not None
+                    and self._links.is_max_linked(chat_id, message_id)):
                 return
-            self._set_content_fingerprint(key, fp)
-            if key in self._forward_map:
-                await self._mirror_edit(message, client)
-                return
-            self._delivered_cache.discard(key)
         await self._handle_incoming_message(message, client, _allow_redeliver=True)
 
     async def _on_message_delete(self, event, client) -> None:
@@ -1883,9 +1793,9 @@ class MaxToTelegramBridge:
         if chat_id is None:
             return
         for mid in getattr(event, "message_ids", None) or []:
-            key = (str(chat_id), str(mid))
-            entries = self._forward_map.pop(key, None)
-            for entry in entries or []:
+            entries = self._links.tg_targets_for_max(chat_id, mid)
+            self._links.remove_max(chat_id, mid)
+            for entry in entries:
                 try:
                     await asyncio.to_thread(
                         tg.delete_message,
@@ -1898,51 +1808,6 @@ class MaxToTelegramBridge:
                         "Failed to mirror MAX delete to Telegram msg %s: %s",
                         entry["message_id"], exc,
                     )
-
-    async def _on_reaction_update(self, event, client) -> None:
-        if client is not self._client:
-            return
-        chat_id = getattr(event, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if chat_id is None or message_id is None:
-            return
-        key = (str(chat_id), str(message_id))
-        entries = self._forward_map.get(key)
-        if not entries:
-            return
-        guard_until = self._mirror_edit_until.get(key)
-        if guard_until is not None:
-            now = asyncio.get_running_loop().time()
-            if now < guard_until:
-                _logger.debug(
-                    "Skipping reaction mirror for MAX msg %s (recent edit)",
-                    message_id,
-                )
-                return
-            self._mirror_edit_until.pop(key, None)
-        head = entries[0]
-        reaction: str | None = None
-        counters = getattr(event, "counters", None) or []
-        total = int(getattr(event, "total_count", 0) or 0)
-        if total > 0 and counters:
-            top = max(counters, key=lambda c: int(getattr(c, "count", 0) or 0))
-            reaction = getattr(top, "reaction", None)
-        if self._mirrored_reactions.get(key) == reaction:
-            return
-        try:
-            await asyncio.to_thread(
-                tg.set_message_reaction,
-                self._token,
-                head["telegram_chat_id"],
-                head["message_id"],
-                reaction,
-            )
-            self._mirrored_reactions[key] = reaction
-        except Exception as exc:
-            _logger.warning(
-                "Failed to mirror MAX reaction to Telegram msg %s: %s",
-                head["message_id"], exc,
-            )
 
     # --- Telegram -> MAX -----------------------------------------------------
 
@@ -1969,7 +1834,11 @@ class MaxToTelegramBridge:
             self._mark_max_outbound(chat_id, sent)
             max_msg_id = getattr(sent, "id", None)
             if tg_message_id and max_msg_id is not None:
-                self._remember_tg_sent(tg_message_id, chat_id, max_msg_id)
+                self._remember_tg_sent(
+                    tg_message_id, chat_id, max_msg_id,
+                    telegram_chat_id=telegram_chat_id,
+                    message_thread_id=thread_id,
+                )
         except Exception as exc:
             _logger.warning("Could not send Telegram reply to MAX chat %s: %s",
                             chat_id, exc)
@@ -2066,7 +1935,7 @@ class MaxToTelegramBridge:
 
     @classmethod
     def _telegram_outgoing_text(cls, message: dict) -> str:
-        markdown = telegram_outgoing_with_quote(message)
+        markdown = telegram_message_markdown(message)
         media_note = cls._telegram_media_note(message)
         if media_note and markdown:
             return f"{markdown}\n\n{media_note}"
@@ -2113,6 +1982,8 @@ class MaxToTelegramBridge:
                 if tg_message_id and max_msg_id is not None:
                     self._remember_tg_sent(
                         tg_message_id, target["chat_id"], max_msg_id,
+                        telegram_chat_id=telegram_chat_id,
+                        message_thread_id=thread_id,
                     )
                 if self._confirm_sent:
                     await asyncio.to_thread(
@@ -2150,48 +2021,34 @@ class MaxToTelegramBridge:
     async def _handle_edited_message(self, message: dict) -> None:
         if self._telegram_has_media(message):
             return
-        target = self._lookup_max_message(message.get("message_id"))
-        if not target or self._client is None:
-            return
-        text = telegram_message_markdown(message)
-        if not text:
-            return
-        max_chat_id = target["max_chat_id"]
-        max_message_id = target["max_message_id"]
-        try:
-            await self._client.edit_message(
-                int(max_chat_id), int(max_message_id), text,
-            )
-        except Exception as exc:
-            _logger.warning(
-                "Could not mirror Telegram edit to MAX chat %s msg %s: %s",
-                max_chat_id, max_message_id, exc,
-            )
+        await self._sync.on_tg_edited_message(message)
 
     async def _handle_message_reaction(self, reaction_update: dict) -> None:
-        user = reaction_update.get("user") or {}
-        if self._bot_id and user.get("id") == self._bot_id:
+        await self._sync.on_tg_reaction(reaction_update)
+
+    async def _handle_message_reaction_count(self, reaction_update: dict) -> None:
+        await self._sync.on_tg_reaction_count(reaction_update)
+
+    async def _warn_forum_admin_if_needed(self) -> None:
+        if not self._forum_chat_id or not self._bot_id:
             return
-        tg_msg_id = reaction_update.get("message_id")
-        target = self._lookup_max_message(tg_msg_id)
-        if not target or self._client is None:
-            return
-        max_chat_id = int(target["max_chat_id"])
-        max_message_id = str(target["max_message_id"])
-        new_reactions = reaction_update.get("new_reaction") or []
         try:
-            if new_reactions:
-                emoji = new_reactions[0].get("emoji")
-                if emoji:
-                    await self._client.add_reaction(
-                        max_chat_id, max_message_id, emoji,
-                    )
-            else:
-                await self._client.remove_reaction(max_chat_id, max_message_id)
+            member = await asyncio.to_thread(
+                tg.get_chat_member,
+                self._token,
+                self._forum_chat_id,
+                self._bot_id,
+            )
         except Exception as exc:
+            _logger.debug("Could not check forum admin status: %s", exc)
+            return
+        status = (member.get("status") or "").lower()
+        if status not in ("administrator", "creator"):
             _logger.warning(
-                "Could not mirror Telegram reaction to MAX chat %s msg %s: %s",
-                max_chat_id, max_message_id, exc,
+                "Telegram bot is not an administrator in forum chat %s — "
+                "TG→MAX reaction mirroring will not work until the bot is "
+                "promoted. MAX→TG reactions are unaffected.",
+                self._forum_chat_id,
             )
 
     async def _register_commands(self) -> None:
@@ -2299,6 +2156,11 @@ class MaxToTelegramBridge:
         if update.get("message_reaction"):
             await self._handle_message_reaction(update["message_reaction"])
             return
+        if update.get("message_reaction_count"):
+            await self._handle_message_reaction_count(
+                update["message_reaction_count"],
+            )
+            return
         message = update.get("message")
         if not message:
             return
@@ -2323,7 +2185,10 @@ class MaxToTelegramBridge:
         if not text and not self._telegram_attachment(message):
             return
         reply = message.get("reply_to_message")
-        target = self._reply_map.get(reply.get("message_id")) if reply else None
+        target = (
+            self._links.reply_target_for_tg(reply.get("message_id"))
+            if reply else None
+        )
         if target:
             await self._send_telegram_update_to_max(target, message)
             return
@@ -2420,6 +2285,7 @@ class MaxToTelegramBridge:
         except Exception as exc:
             _logger.warning("Could not fetch Telegram bot id: %s", exc)
         _logger.info("Bridge online (own id: %s).", self._own_id)
+        await self._warn_forum_admin_if_needed()
         try:
             await self._preload_topics(client)
         except Exception:
@@ -2449,7 +2315,7 @@ class MaxToTelegramBridge:
         client.on_message()(self._on_message)
         client.on_message_edit()(self._on_message_edit)
         client.on_message_delete()(self._on_message_delete)
-        client.on_reaction_update()(self._on_reaction_update)
+        client.on_raw()(self._sync.on_max_raw)
         client.on_start()(self._on_start)
         self._client = client
         try:

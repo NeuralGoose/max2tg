@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from bridge import MaxToTelegramBridge
+from tests.test_link_fixtures import seed_max_to_tg_link, seed_tg_to_max_link
 
 
 class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
@@ -82,7 +83,14 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_reply_routes_to_mapped_max_message(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._reply_map[100] = self._target(message_id=42)
+        bridge._links.link(
+            "555", "42",
+            telegram_chat_id=111,
+            telegram_message_id=100,
+            role="text",
+            origin="max_to_tg",
+            sender="Иван",
+        )
         update = {"message": {
             "chat": {"id": 111},
             "reply_to_message": {"message_id": 100},
@@ -96,7 +104,14 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_bold_reply_converts_to_markdown(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._reply_map[100] = self._target(message_id=42)
+        bridge._links.link(
+            "555", "42",
+            telegram_chat_id=111,
+            telegram_message_id=100,
+            role="text",
+            origin="max_to_tg",
+            sender="Иван",
+        )
         update = {"message": {
             "chat": {"id": 111},
             "reply_to_message": {"message_id": 100},
@@ -111,7 +126,14 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_multi_entity_reply_converts_to_markdown(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._reply_map[100] = self._target(message_id=42)
+        bridge._links.link(
+            "555", "42",
+            telegram_chat_id=111,
+            telegram_message_id=100,
+            role="text",
+            origin="max_to_tg",
+            sender="Иван",
+        )
         line = "Съешь ещё этих мягких французских булок, да выпей же чаю"
         from formatting import py_index_to_utf16, utf16_len
 
@@ -157,10 +179,11 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_tg_edited_message_updates_max(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._tg_sent_to_max[100] = {
-            "max_chat_id": 555,
-            "max_message_id": 42,
-        }
+        seed_tg_to_max_link(
+            bridge,
+            tg_message_id=100,
+            max_message_id="42",
+        )
         update = {"edited_message": {
             "message_id": 100,
             "text": "updated",
@@ -173,10 +196,11 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
     async def test_tg_reaction_updates_max(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._tg_sent_to_max[100] = {
-            "max_chat_id": 555,
-            "max_message_id": 42,
-        }
+        seed_tg_to_max_link(
+            bridge,
+            tg_message_id=100,
+            max_message_id="42",
+        )
         update = {"message_reaction": {
             "message_id": 100,
             "user": {"id": 111},
@@ -194,12 +218,19 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
             await bridge._send_reply_to_max(
                 self._target(), "привет", tg_message_id=100,
             )
-        self.assertEqual(bridge._tg_sent_to_max[100]["max_message_id"], 77)
+        self.assertEqual(bridge._lookup_max_message(100)["max_message_id"], "77")
 
-    async def test_telegram_quote_reply_prefixes_max_text(self):
+    async def test_telegram_quote_reply_sends_body_only_with_native_reply(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._reply_map[100] = self._target(message_id=42)
+        bridge._links.link(
+            "555", "42",
+            telegram_chat_id=111,
+            telegram_message_id=100,
+            role="text",
+            origin="max_to_tg",
+            sender="Иван",
+        )
         update = {"message": {
             "chat": {"id": 111},
             "reply_to_message": {
@@ -211,17 +242,21 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
         }}
         with patch("bridge.tg.send_message", return_value=1):
             await bridge._handle_update(update)
-        sent_text = bridge._client.send_message.await_args.args[1]
-        self.assertIn("мой ответ", sent_text)
-        self.assertIn("исходное", sent_text)
-        self.assertIn("ответ на", sent_text.lower())
         bridge._client.send_message.assert_awaited_once_with(
-            555, sent_text, reply_to=42)
+            555, "мой ответ", reply_to=42,
+        )
 
-    async def test_telegram_reply_to_message_snippet_when_no_quote_field(self):
+    async def test_telegram_reply_to_message_body_only_without_quote_prefix(self):
         bridge = self._bridge(telegram_confirm_sent=False)
         bridge._client = self._client()
-        bridge._reply_map[100] = self._target(message_id=42)
+        bridge._links.link(
+            "555", "42",
+            telegram_chat_id=111,
+            telegram_message_id=100,
+            role="text",
+            origin="max_to_tg",
+            sender="Иван",
+        )
         update = {"message": {
             "chat": {"id": 111},
             "reply_to_message": {
@@ -232,10 +267,58 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
         }}
         with patch("bridge.tg.send_message", return_value=1):
             await bridge._handle_update(update)
-        sent_text = bridge._client.send_message.await_args.args[1]
-        self.assertIn("родительский текст", sent_text)
-        self.assertIn("ответ без quote", sent_text)
-        self.assertIn("ответ на", sent_text.lower())
+        bridge._client.send_message.assert_awaited_once_with(
+            555, "ответ без quote", reply_to=42,
+        )
+
+    async def test_telegram_outgoing_text_ignores_reply_quote_prefix(self):
+        message = {
+            "reply_to_message": {"message_id": 1, "text": "parent"},
+            "quote": {"text": "parent"},
+            "text": "reply body",
+        }
+        self.assertEqual(
+            MaxToTelegramBridge._telegram_outgoing_text(message),
+            "reply body",
+        )
+
+    async def test_lookup_max_message_via_forward_map_media(self):
+        bridge = self._bridge(telegram_confirm_sent=False)
+        seed_max_to_tg_link(
+            bridge,
+            tg_message_id=10,
+            role="caption",
+        )
+        bridge._links.link(
+            "555", "1",
+            telegram_chat_id=-100222,
+            telegram_message_id=11,
+            role="media",
+            origin="max_to_tg",
+        )
+        target = bridge._lookup_max_message(11)
+        self.assertEqual(target["max_chat_id"], 555)
+        self.assertEqual(target["max_message_id"], "1")
+
+    async def test_tg_reaction_count_updates_max(self):
+        bridge = self._bridge(telegram_confirm_sent=False)
+        bridge._client = self._client()
+        seed_tg_to_max_link(
+            bridge,
+            tg_message_id=100,
+            max_message_id="42",
+        )
+        update = {"message_reaction_count": {
+            "message_id": 100,
+            "reactions": [
+                {"type": "emoji", "emoji": "👍", "total_count": 3},
+                {"type": "emoji", "emoji": "❤️", "total_count": 1},
+            ],
+        }}
+        await bridge._handle_update(update)
+        bridge._client.add_reaction.assert_awaited_once_with(
+            555, "42", "👍",
+        )
 
 
 if __name__ == "__main__":

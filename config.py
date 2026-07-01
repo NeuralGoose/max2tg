@@ -72,6 +72,30 @@ def _normalize_preload_chat_source(value) -> str:
     return source if source in ("login", "fetch") else "login"
 
 
+def _parse_poll_delays(value) -> tuple[int, ...]:
+    default = (2, 15, 60, 300)
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)):
+        try:
+            return tuple(max(0, int(x)) for x in value) or default
+        except (TypeError, ValueError):
+            return default
+    raw = str(value).strip()
+    if not raw:
+        return default
+    parts: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parts.append(max(0, int(part)))
+        except ValueError:
+            continue
+    return tuple(parts) if parts else default
+
+
 def _parse_exclude_chat_ids(value) -> frozenset[int]:
     """MAX chat ids to never bridge (default: 0 = Saved Messages / Избранное)."""
     if value is None:
@@ -167,6 +191,25 @@ def normalize_config(data: dict) -> dict:
         result.get("max_mark_read_on_telegram_forward"),
         default=False,
     )
+    result["telegram_mirror_reaction_debug"] = _coerce_bool(
+        result.get("telegram_mirror_reaction_debug"),
+        default=False,
+    )
+    result["sync_debug"] = _coerce_bool(
+        result.get("sync_debug"),
+        default=result["telegram_mirror_reaction_debug"],
+    )
+    result["sync_reaction_poll_delays"] = _parse_poll_delays(
+        result.get("sync_reaction_poll_delays"),
+    )
+    result["sync_reaction_watch_ttl"] = max(
+        0,
+        _coerce_int(result.get("sync_reaction_watch_ttl"), 86400),
+    )
+    result["sync_reaction_coalesce_seconds"] = max(
+        0.0,
+        _coerce_float(result.get("sync_reaction_coalesce_seconds"), 0.5),
+    )
     result["telegram_exclude_chat_ids"] = _parse_exclude_chat_ids(
         result.get("telegram_exclude_chat_ids"),
     )
@@ -234,7 +277,13 @@ ENV_MAP = {
     "telegram_confirm_sent": "MAX2TG_TELEGRAM_CONFIRM_SENT",
     "telegram_mirror_edit_marker": "MAX2TG_TELEGRAM_MIRROR_EDIT_MARKER",
     "max_mark_read_on_telegram_forward": "MAX2TG_MAX_MARK_READ_ON_TELEGRAM_FORWARD",
+    "telegram_mirror_reaction_debug": "MAX2TG_TELEGRAM_MIRROR_REACTION_DEBUG",
+    "sync_debug": "MAX2TG_SYNC_DEBUG",
+    "sync_reaction_poll_delays": "MAX2TG_SYNC_REACTION_POLL_DELAYS",
+    "sync_reaction_watch_ttl": "MAX2TG_SYNC_REACTION_WATCH_TTL",
+    "sync_reaction_coalesce_seconds": "MAX2TG_SYNC_REACTION_COALESCE_SECONDS",
     "telegram_exclude_chat_ids": "MAX2TG_TELEGRAM_EXCLUDE_CHAT_IDS",
+    "links_db_path": "MAX2TG_LINKS_DB_PATH",
 }
 
 

@@ -68,7 +68,7 @@ class FallbackModeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("(чат 555)", body)
             self.assertIn("привет", body)
             self.assertIsNone(send.call_args.kwargs.get("message_thread_id"))
-            self.assertIn(10, bridge._reply_map)
+            self.assertIsNotNone(bridge._links.reply_target_for_tg(10))
 
     async def test_dedup_persists_without_topic_across_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,10 +136,14 @@ class HandleUpdateRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reply_routes_to_mapped_target(self):
         bridge = self._bridge()
-        bridge._reply_map[50] = {
-            "chat_id": 555, "message_id": 42, "sender": "Иван",
-            "telegram_chat_id": 111, "message_thread_id": None,
-        }
+        bridge._links.link(
+            "555", "42",
+            telegram_chat_id=111,
+            telegram_message_id=50,
+            role="text",
+            origin="max_to_tg",
+            sender="Иван",
+        )
         update = {"message": {"chat": {"id": 111}, "from": {"id": 111},
                               "text": "ответ",
                               "reply_to_message": {"message_id": 50}}}

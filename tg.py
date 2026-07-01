@@ -287,7 +287,10 @@ def get_me(token: str) -> dict:
 def get_updates(token: str, offset: int | None = None, timeout: int = 25) -> list[dict]:
     params = {
         "timeout": timeout,
-        "allowed_updates": ["message", "edited_message", "message_reaction"],
+        "allowed_updates": [
+            "message", "edited_message", "message_reaction",
+            "message_reaction_count",
+        ],
     }
     if offset is not None:
         params["offset"] = offset
@@ -353,14 +356,26 @@ def set_message_reaction(
     chat_id: int | str,
     message_id: int,
     reaction: str | None,
+    *,
+    message_thread_id: int | None = None,
 ) -> None:
     """Set or clear the bot's reaction on a message."""
     params: dict = {"chat_id": chat_id, "message_id": message_id}
+    if message_thread_id:
+        params["message_thread_id"] = message_thread_id
     if reaction:
         params["reaction"] = [{"type": "emoji", "emoji": reaction}]
     else:
         params["reaction"] = []
     _call(token, "setMessageReaction", **params)
+
+
+def get_chat_member(
+    token: str,
+    chat_id: int | str,
+    user_id: int,
+) -> dict:
+    return _call(token, "getChatMember", chat_id=chat_id, user_id=user_id)
 
 
 def get_file(token: str, file_id: str) -> dict:

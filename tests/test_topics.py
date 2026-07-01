@@ -385,7 +385,7 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
         with patch("bridge.tg.send_message", return_value=42), \
                 patch("bridge.maxactions.find", new=AsyncMock(return_value=result)):
             await bridge._handle_command(111, None, "/find 777")
-        self.assertNotIn(42, bridge._reply_map)
+        self.assertIsNone(bridge._links.reply_target_for_tg(42))
 
     async def test_help_command_replies(self):
         bridge = self.make_bridge()
@@ -447,8 +447,8 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("(чат 555)", body)
             self.assertIn("привет", body)
             self.assertIsNone(send.call_args.kwargs.get("message_thread_id"))
-            self.assertIn(10, bridge._reply_map)
-            self.assertEqual(bridge._reply_map[10]["chat_id"], 555)
+            self.assertIsNotNone(bridge._links.reply_target_for_tg(10))
+            self.assertEqual(bridge._links.reply_target_for_tg(10)["chat_id"], 555)
 
     async def test_text_inside_topic_routes_to_max_chat(self):
         bridge = self.make_bridge()

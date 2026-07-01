@@ -85,7 +85,7 @@
 - 🎤 **Голосовые и видео-кружки.** Приходят в Telegram как обычные проигрываемые
   сообщения, а не как «открыть в MAX»: надёжный резолв медиа, включая обход бага
   парсинга кружков в библиотеке (`mediamax.py`).
-- 🛡 **Надёжность.** Атомарная запись `config.json` / `state.json`, восстановление
+- 🛡 **Надёжность.** Атомарная запись `config.json` / `state.json` / `links.db`, восстановление
   после повреждённого `state.json`, дедуп без тем (для fallback-режима), повтор
   при частичной доставке, пересоздание «протухших» тем, команды форума только для
   владельца, защита загрузки медиа.
@@ -326,6 +326,19 @@ docker compose up -d      # подтянет ghcr.io/neuralgoose/max2tg:latest
 <br>Добавьте в `config.json`: <code>"telegram_confirm_sent": false</code> (или
 переменную окружения <code>MAX2TG_TELEGRAM_CONFIRM_SENT=false</code>). Ошибки
 отправки при этом всё равно показываются.
+</details>
+
+<details>
+<summary><b>Реакции (эмодзи) не зеркалируются из Telegram в MAX</b></summary>
+
+<br>Чтобы бот получал обновления <code>message_reaction</code> в супергруппе-форуме,
+он должен быть <b>администратором</b> чата (требование Telegram Bot API).
+Без прав администратора реакции в Telegram не доходят до моста — в логе не будет
+ошибок, только отсутствие строк <code>Mirrored Telegram reaction</code>.
+В анонимном режиме реакций Telegram присылает <code>message_reaction_count</code> —
+мост обрабатывает и его. Для отладки пропусков включите
+<code>"telegram_mirror_reaction_debug": true</code> (или
+<code>MAX2TG_TELEGRAM_MIRROR_REACTION_DEBUG=true</code>).
 </details>
 
 <details>

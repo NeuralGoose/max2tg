@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock, Mock, patch
 import bridge as bridge_module
 from bridge import MaxToTelegramBridge
 from message_content import message_content_fingerprint
+from pymax.protocol import Opcode
 from state import BridgeState
 import tg
+from tests.test_link_fixtures import seed_max_to_tg_link, seed_tg_to_max_link
 
 
 def _user(*, name=None, first=None, last=None):
@@ -32,6 +34,7 @@ def _message(*, id=1, chat_id=555, sender=7, text="", attaches=None,
 
 class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
     def _bridge(self, tmp, **overrides):
+        state_path = Path(tmp) / "state.json"
         config = {
             "telegram_bot_token": "token",
             "telegram_chat_id": 111,
@@ -39,10 +42,11 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             "telegram_forum_chat_id": -100222,
             "telegram_topics_enabled": True,
             "max_login_token": "max",
+            "links_db_path": str(state_path.with_name("links.db")),
         }
         config.update(overrides)
         bridge = MaxToTelegramBridge(config)
-        bridge._state = BridgeState(Path(tmp) / "state.json")
+        bridge._state = BridgeState(state_path)
         bridge._own_id = 999
         return bridge
 
@@ -68,7 +72,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Иван Петров:", body)
             self.assertIn("привет", body)
             self.assertEqual(send.call_args.kwargs["message_thread_id"], 42)
-            self.assertIn(10, bridge._reply_map)
+            self.assertIsNotNone(bridge._links.reply_target_for_tg(10))
 
     async def test_forwards_own_message(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,12 +128,11 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                                      chat_type="dialog")
             client = self._client()
             bridge._client = client
-            bridge._forward_map[("555", "1")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 10,
-                "role": "text",
-                "message_thread_id": 42,
-            }]
+            seed_max_to_tg_link(
+                bridge,
+                tg_message_id=10,
+                message_thread_id=42,
+            )
             with patch(
                 "bridge.tg.edit_message_text",
                 return_value={"message_id": 10, "edit_date": 1710000000},
@@ -139,7 +142,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 edit.call_args.kwargs["message_thread_id"], 42,
             )
-            self.assertIn(("555", "1"), bridge._mirror_edit_until)
+            self.assertIn(("555", "1"), bridge._sync._edit_guard_until)
             send.assert_not_called()
 
     async def test_edit_unmapped_forwards_without_edit_mark(self):
@@ -147,7 +150,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
-            bridge._content_fingerprints[("555", "5")] = (
+            bridge._sync._classifier._fingerprints[("555", "5")] = (
                 message_content_fingerprint(_message(id=5, text="old"))
             )
             with patch("bridge.tg.create_forum_topic", return_value=42), \
@@ -203,11 +206,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                                      chat_type="dialog")
             client = self._client()
             bridge._client = client
-            bridge._forward_map[("555", "1")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 10,
-                "role": "text",
-            }]
+            seed_max_to_tg_link(bridge, tg_message_id=10)
             event = SimpleNamespace(chat_id=555, message_ids=[1])
             with patch("bridge.tg.delete_message") as delete, \
                     patch("bridge.tg.send_message") as send:
@@ -216,7 +215,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                 "token", -100222, 10,
             )
             send.assert_not_called()
-            self.assertNotIn(("555", "1"), bridge._forward_map)
+            self.assertFalse(bridge._links.is_max_linked("555", "1"))
 
     async def test_forwarded_group_post_shows_attribution_and_text(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -351,7 +350,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             client = self._client()
             bridge._client = client
             msg = _message(id=5, text="same", stats={"comments": 1})
-            bridge._content_fingerprints[("555", "5")] = (
+            bridge._sync._classifier._fingerprints[("555", "5")] = (
                 message_content_fingerprint(msg)
             )
             edited = _message(id=5, text="same", stats={"comments": 9})
@@ -366,7 +365,7 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             bridge._client = client
             bridge._state.mark_delivered(555, 5)
             bridge._hydrate_delivered_cache()
-            bridge._content_fingerprints[("555", "5")] = (
+            bridge._sync._classifier._fingerprints[("555", "5")] = (
                 message_content_fingerprint(_message(id=5, text="old"))
             )
             with patch("bridge.tg.create_forum_topic", return_value=42), \
@@ -375,45 +374,29 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             send.assert_called_once()
             self.assertNotIn("(изменено)", send.call_args.args[2])
 
-    async def test_mirror_reaction_sets_tg_reaction(self):
+    async def test_bridge_raw_handler_delegates_to_sync(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
-            bridge._forward_map[("555", "1")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 10,
-                "role": "text",
-            }]
-            counter = SimpleNamespace(count=2, reaction="👍")
-            event = SimpleNamespace(
-                chat_id=555, message_id="1", counters=[counter], total_count=2,
+            seed_max_to_tg_link(bridge, tg_message_id=10)
+            frame = SimpleNamespace(
+                opcode=int(Opcode.NOTIF_MSG_REACTIONS_CHANGED),
+                cmd=0,
+                payload={
+                    "chatId": 555,
+                    "messageId": "1",
+                    "counters": [{"count": 2, "reaction": "👍"}],
+                    "totalCount": 2,
+                },
             )
-            with patch("bridge.tg.set_message_reaction") as react:
-                await bridge._on_reaction_update(event, client)
-            react.assert_called_once_with("token", -100222, 10, "👍")
-
-    async def test_mirror_reaction_skipped_after_recent_edit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            bridge = self._bridge(tmp)
-            client = self._client()
-            bridge._client = client
-            bridge._forward_map[("555", "1")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 10,
-                "role": "text",
-            }]
-            loop = asyncio.get_running_loop()
-            bridge._mirror_edit_until[("555", "1")] = loop.time() + 60
-            counter = SimpleNamespace(count=2, reaction="👍")
-            event = SimpleNamespace(
-                chat_id=555, message_id="1", counters=[counter], total_count=2,
+            with patch("message_sync.tg.set_message_reaction") as react:
+                await bridge._sync.on_max_raw(frame, client)
+            react.assert_called_once_with(
+                "token", -100222, 10, "👍", message_thread_id=None,
             )
-            with patch("bridge.tg.set_message_reaction") as react:
-                await bridge._on_reaction_update(event, client)
-            react.assert_not_called()
 
-    async def test_mirror_edit_marker_on_by_default(self):
+    async def test_opcode_156_not_mirrored(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             self.assertTrue(bridge._mirror_edit_marker)
@@ -421,12 +404,11 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                                      chat_type="dialog")
             client = self._client()
             bridge._client = client
-            bridge._forward_map[("555", "1")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 10,
-                "role": "text",
-                "message_thread_id": 42,
-            }]
+            seed_max_to_tg_link(
+                bridge,
+                tg_message_id=10,
+                message_thread_id=42,
+            )
             with patch(
                 "bridge.tg.edit_message_text",
                 return_value={"message_id": 10, "edit_date": 1},
@@ -441,12 +423,11 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                                      chat_type="dialog")
             client = self._client()
             bridge._client = client
-            bridge._forward_map[("555", "1")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 10,
-                "role": "text",
-                "message_thread_id": 42,
-            }]
+            seed_max_to_tg_link(
+                bridge,
+                tg_message_id=10,
+                message_thread_id=42,
+            )
             with patch(
                 "bridge.tg.edit_message_text",
                 return_value={"message_id": 10, "edit_date": 1},
@@ -548,12 +529,12 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
-            bridge._forward_map[("555", "100")] = [{
-                "telegram_chat_id": -100222,
-                "message_id": 50,
-                "role": "text",
-                "message_thread_id": 42,
-            }]
+            seed_max_to_tg_link(
+                bridge,
+                max_message_id="100",
+                tg_message_id=50,
+                message_thread_id=42,
+            )
             msg = _message(
                 id=200,
                 text="мой ответ",
@@ -619,6 +600,57 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             client.read_message.assert_not_called()
+
+    async def test_opcode_156_not_mirrored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client = self._client()
+            bridge._client = client
+            seed_max_to_tg_link(bridge, tg_message_id=10)
+            frame = SimpleNamespace(
+                opcode=int(Opcode.NOTIF_MSG_YOU_REACTED),
+                cmd=0,
+                payload={
+                    "chatId": 555,
+                    "messageId": "1",
+                    "reactionInfo": {
+                        "counters": [{"count": 1, "reaction": "👍"}],
+                        "totalCount": 1,
+                        "yourReaction": "👍",
+                    },
+                },
+            )
+            with patch("message_sync.tg.set_message_reaction") as react:
+                await bridge._sync.on_max_raw(frame, client)
+            react.assert_not_called()
+
+    async def test_hydrate_message_links_from_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            bridge._state.save_topic(
+                555, thread_id=42, title="Test", chat_type="chat",
+            )
+            bridge._state.record_message_mirror(
+                555, "1",
+                telegram_chat_id=-100222,
+                telegram_message_id=10,
+                message_thread_id=42,
+                role="caption",
+            )
+            bridge._state.record_message_mirror(
+                555, "1",
+                telegram_chat_id=-100222,
+                telegram_message_id=11,
+                message_thread_id=42,
+                role="media",
+            )
+            bridge._hydrate_message_links()
+            entries = bridge._links.tg_targets_for_max("555", "1")
+            self.assertEqual(entries[0]["message_id"], 10)
+            target = bridge._lookup_max_message(11)
+            self.assertEqual(target["max_message_id"], "1")
+            reply = bridge._links.reply_target_for_tg(10)
+            self.assertEqual(reply["chat_id"], 555)
 
 
 if __name__ == "__main__":

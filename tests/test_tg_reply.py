@@ -31,5 +31,18 @@ class TgReplyTests(unittest.TestCase):
         self.assertNotIn("reply_to_message_id", params)
 
 
+    @patch("tg._call")
+    def test_set_message_reaction_forwards_message_thread_id(self, mock_call):
+        tg.set_message_reaction(
+            "token", -1001, 10, "👍", message_thread_id=42,
+        )
+        args, kwargs = mock_call.call_args
+        self.assertEqual(args[1], "setMessageReaction")
+        self.assertEqual(kwargs["message_thread_id"], 42)
+        self.assertEqual(
+            kwargs["reaction"], [{"type": "emoji", "emoji": "👍"}],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
