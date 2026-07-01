@@ -1,5 +1,4 @@
 """Stage 3: typed PyMax inbound handlers on MaxToTelegramBridge."""
-import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +11,7 @@ from message_content import message_content_fingerprint
 from pymax.protocol import Opcode
 from state import BridgeState
 import tg
-from tests.test_link_fixtures import seed_max_to_tg_link, seed_tg_to_max_link
+from tests.test_link_fixtures import seed_max_to_tg_link
 
 
 def _user(*, name=None, first=None, last=None):
@@ -395,26 +394,6 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             react.assert_called_once_with(
                 "token", -100222, 10, "👍", message_thread_id=None,
             )
-
-    async def test_opcode_156_not_mirrored(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            bridge = self._bridge(tmp)
-            self.assertTrue(bridge._mirror_edit_marker)
-            bridge._state.save_topic(555, thread_id=42, title="X",
-                                     chat_type="dialog")
-            client = self._client()
-            bridge._client = client
-            seed_max_to_tg_link(
-                bridge,
-                tg_message_id=10,
-                message_thread_id=42,
-            )
-            with patch(
-                "bridge.tg.edit_message_text",
-                return_value={"message_id": 10, "edit_date": 1},
-            ) as edit, patch("bridge.tg.send_message"):
-                await bridge._on_message_edit(_message(text="новое"), client)
-            self.assertIn(" · ред.", edit.call_args.args[3])
 
     async def test_mirror_edit_marker_appends_suffix_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:

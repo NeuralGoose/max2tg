@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from message_content import message_content_fingerprint
 from message_links import MessageLinkRegistry
 from message_sync import (
     EditResolveResult,

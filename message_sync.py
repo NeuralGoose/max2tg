@@ -649,7 +649,6 @@ class MessageSync:
         ]
         if not keys:
             return
-        msg_ids = [k[1] for k in keys]
         to_fetch: list[str] = []
         for key in keys:
             entry = self._watch[key]
