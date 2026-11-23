@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import mediamax
 from pymax import File, Photo, Video
-from pymax.protocol import Opcode
+from pymax.types.domain.attachments.video import VideoRequest
 
 
 class SendUploadedMediaTests(unittest.IsolatedAsyncioTestCase):
@@ -83,52 +83,22 @@ class ResolveTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await mediamax.resolve_video_url(client, 7, 555, 4242)
 
-    @staticmethod
-    def _validation_error():
-        """Build a real pydantic ValidationError, like the one PyMax raises when
-        a video-note payload omits the required ``cache`` field."""
-        from pydantic import BaseModel, ValidationError
-
-        class _Req(BaseModel):
-            cache: bool
-
-        try:
-            _Req.model_validate({})
-        except ValidationError as exc:
-            return exc
-
-    async def test_resolve_video_url_falls_back_to_raw_on_typed_error(self):
+    async def test_video_note_renditions_resolve_via_typed_model(self):
+        """Video notes return only a rendition map (no ``cache``); PyMax's
+        VideoRequest must still pick the best MP4 URL."""
+        request = VideoRequest.model_validate(
+            {"MP4_480": "https://v/480.mp4", "MP4_240": "https://v/240.mp4"})
         client = Mock()
-        client.get_video_by_id = AsyncMock(side_effect=self._validation_error())
-        invoke = AsyncMock(return_value=SimpleNamespace(
-            payload={"MP4_480": "https://v/480.mp4",
-                     "MP4_720": "https://v/720.mp4"}))
-        client._app = SimpleNamespace(invoke=invoke)
+        client.get_video_by_id = AsyncMock(return_value=request)
         url = await mediamax.resolve_video_url(client, 7, 555, 4242)
-        self.assertEqual(url, "https://v/720.mp4")
-        invoke.assert_awaited_once_with(
-            Opcode.VIDEO_PLAY,
-            {"chatId": 555, "messageId": 4242, "videoId": 7})
+        self.assertEqual(url, "https://v/480.mp4")
 
-    async def test_resolve_video_url_raw_no_url_raises(self):
+    async def test_external_video_falls_back_to_external_link(self):
+        request = VideoRequest.model_validate({"EXTERNAL": "https://ext/v"})
         client = Mock()
-        client.get_video_by_id = AsyncMock(side_effect=self._validation_error())
-        client._app = SimpleNamespace(
-            invoke=AsyncMock(return_value=SimpleNamespace(payload={})))
-        with self.assertRaises(RuntimeError):
-            await mediamax.resolve_video_url(client, 7, 555, 4242)
-
-    def test_best_mp4_url_picks_highest_rendition(self):
-        self.assertEqual(
-            mediamax._best_mp4_url(
-                {"MP4_240": "a", "MP4_1080": "b", "MP4_480": "c"}),
-            "b")
-
-    def test_best_mp4_url_falls_back_to_url_then_external(self):
-        self.assertEqual(mediamax._best_mp4_url({"url": "u"}), "u")
-        self.assertEqual(mediamax._best_mp4_url({"EXTERNAL": "e"}), "e")
-        self.assertIsNone(mediamax._best_mp4_url({}))
-        self.assertIsNone(mediamax._best_mp4_url(None))
+        client.get_video_by_id = AsyncMock(return_value=request)
+        url = await mediamax.resolve_video_url(client, 7, 555, 4242)
+        self.assertEqual(url, "https://ext/v")
 
 
 if __name__ == "__main__":
