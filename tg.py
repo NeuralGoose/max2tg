@@ -289,7 +289,7 @@ def get_updates(token: str, offset: int | None = None, timeout: int = 25) -> lis
         "timeout": timeout,
         "allowed_updates": [
             "message", "edited_message", "message_reaction",
-            "message_reaction_count",
+            "message_reaction_count", "callback_query",
         ],
     }
     if offset is not None:
@@ -341,6 +341,29 @@ def edit_message_caption(
     if caption_entities:
         params["caption_entities"] = caption_entities
     return _call_with_entity_fallback(token, "editMessageCaption", params)
+
+
+def edit_message_reply_markup(
+    token: str,
+    chat_id: int | str,
+    message_id: int,
+    reply_markup: dict | None,
+) -> None:
+    params: dict = {"chat_id": chat_id, "message_id": message_id}
+    if reply_markup:
+        params["reply_markup"] = reply_markup
+    _call(token, "editMessageReplyMarkup", **params)
+
+
+def answer_callback_query(
+    token: str,
+    callback_query_id: str,
+    text: str | None = None,
+) -> None:
+    params: dict = {"callback_query_id": callback_query_id}
+    if text:
+        params["text"] = text[:200]
+    _call(token, "answerCallbackQuery", **params)
 
 
 def delete_message(
@@ -518,17 +541,19 @@ def send_message(token: str, chat_id: int | str, text: str,
                  reply_to_message_id: int | None = None,
                  message_thread_id: int | None = None,
                  entities: list[dict] | None = None,
-                 reply_parameters: dict | None = None) -> int | None:
+                 reply_parameters: dict | None = None,
+                 reply_markup: dict | None = None) -> int | None:
     """Send text, splitting over Telegram's UTF-16 length limit.
 
     Returns the message_id of the first chunk (used for reply mapping).
+    ``reply_markup`` goes on the last chunk.
     """
     if not text:
         return None
     first_id: int | None = None
     entity_list = list(entities or [])
     chunks = split_text_utf16(text, MAX_MESSAGE_LEN)
-    for chunk_text, chunk_start, chunk_len in chunks:
+    for index, (chunk_text, chunk_start, chunk_len) in enumerate(chunks):
         chunk_entities = split_entities_for_chunk(
             entity_list, chunk_start, chunk_len,
         ) or None
@@ -542,6 +567,8 @@ def send_message(token: str, chat_id: int | str, text: str,
             params["reply_to_message_id"] = reply_to_message_id
         if chunk_entities:
             params["entities"] = chunk_entities
+        if reply_markup and index == len(chunks) - 1:
+            params["reply_markup"] = reply_markup
         result = _call_with_entity_fallback(token, "sendMessage", params)
         if first_id is None:
             first_id = result.get("message_id")

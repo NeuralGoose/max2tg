@@ -21,6 +21,8 @@
 | `message_content.py` | Сборка текста/автора/атрибуции из типизированного сообщения. |
 | `message_links.py` | `MessageLinkRegistry`: соответствие сообщений TG ↔ MAX (`links.db`). |
 | `message_sync.py` | Синхронизация правок и реакций между MAX и Telegram. |
+| `comments.py` | Комментарии к постам каналов: отправка из Telegram, опрос веток. |
+| `keyboards.py` | Inline-кнопки ботов MAX → кнопки Telegram (`button_callbacks`). |
 | `tg.py` | Минимальный клиент Telegram Bot API (с учётом 429/пейсинга). |
 | `state.py` | Персистентный mapping MAX-чат → Telegram-тема и дедуп. |
 | `config.py` | Чтение `config.json` + `.env`, нормализация настроек. |
@@ -51,6 +53,24 @@
   при подключении помечает версию клиента устаревшей — предупреждает один раз.
 - Отправка текста/медиа и resolve файлов/видео идут через типизированный API
   PyMax (`send_message`, `get_file_by_id`, `get_video_by_id`).
+- `on_chat_update`: при переименовании группы/канала в MAX тема Telegram
+  переименовывается сразу (диалоги — только при preload, их имя берётся из
+  контакта).
+- Удаления: `on_message_delete` удаляет копии в Telegram
+  (`MAX2TG_SYNC_DELETE_ENABLED`). Bot API не сообщает об удалениях в Telegram,
+  поэтому обратное направление — команда `/delete` (Reply): `delete_message`
+  для всех, при отказе — только у себя; комментарии — `delete_comment`.
+- Inline-клавиатуры ботов MAX показываются кнопками Telegram: ссылки и
+  «скопировать» — напрямую, callback- и message-кнопки — через токен в
+  `callback_data` (таблица `button_callbacks` в `links.db`); нажатие уходит в
+  `send_callback` (или текстом кнопки). После правки сообщения кнопки
+  навешиваются заново.
+- Комментарии каналов: Reply на пост канала (или на пересланный комментарий)
+  уходит в `send_comment`. События комментариев MAX не присылает, поэтому
+  ветки, где вы участвовали (или запросили `/comments`), опрашиваются
+  `fetch_comments` раз в минуту 3 дня (`MAX2TG_COMMENTS_POLL_INTERVAL`), новые
+  чужие комментарии приходят ответами на пост (`comment_links`,
+  `comment_watch` в `links.db`). Сообщения с `post_id` в общий поток не идут.
 - Идентификаторы сообщений MAX передаются в PyMax как `int` (`read_message`,
   `add_reaction`/`remove_reaction`, `get_reactions`, `edit_message`); в
   `state.json`/`links.db` они хранятся строками.
@@ -59,7 +79,7 @@
 
 Telegram Bot API через `requests` (`tg.py`):
 
-- long-poll `getUpdates` (только `message`);
+- long-poll `getUpdates` (`message`, `edited_message`, реакции, `callback_query`);
 - форум-темы: `createForumTopic` / `editForumTopic`;
 - отправка `sendMessage/sendPhoto/sendDocument/...` с `message_thread_id`;
 - встроенная обработка `429 Too Many Requests` (retry-after) и пейсинг API.
@@ -109,7 +129,8 @@ Telegram Bot API через `requests` (`tg.py`):
 - обычный текст в теме чата уходит в связанный MAX-чат;
 - reply на пересланное сообщение цитирует исходное MAX-сообщение, если есть
   mapping в памяти (`_reply_map`, ограничен по размеру);
-- команды `/join`, `/find`, `/dm` (и «умные» ссылки) выполняются в MAX; в
+- команды `/join`, `/find`, `/dm`, `/delete`, `/comments` (и «умные» ссылки)
+  выполняются в MAX; в
   форум-супергруппе они разрешены только владельцу (по Telegram user id).
 
 ## Ограничения и риски

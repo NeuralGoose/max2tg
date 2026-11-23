@@ -71,6 +71,10 @@ class MessageLinkRegistry:
         self._conn: sqlite3.Connection | None = None
         self._ensure_schema()
 
+    @property
+    def path(self) -> Path:
+        return self._path
+
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
             self._path.parent.mkdir(parents=True, exist_ok=True)

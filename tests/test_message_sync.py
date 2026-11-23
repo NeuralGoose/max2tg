@@ -136,6 +136,21 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
             edit.assert_called_once()
             self.assertIn(("555", "1"), sync._edit_guard_until)
 
+    async def test_edit_reapplies_keyboard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, mirror_edit_marker=False)
+            sync._edit_deps.apply_keyboard = AsyncMock()
+            client = Mock()
+            holder[0] = client
+            links.link("555", "1", telegram_chat_id=-100222,
+                       telegram_message_id=10, origin="max_to_tg")
+            sync._classifier.record_new(555, 1, _message(text="old"))
+            edited = _message(text="новое")
+            with patch("message_sync.tg.edit_message_text",
+                       return_value={"message_id": 10, "edit_date": 1}):
+                await sync.on_max_message_edit(edited, client)
+            sync._edit_deps.apply_keyboard.assert_awaited_once_with(edited, 555, 1)
+
     async def test_max_to_tg_reaction_via_reaction_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             sync, links, holder = self._sync(tmp)

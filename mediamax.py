@@ -55,8 +55,9 @@ def _build_attachment(content: bytes, filename: str, kind: str,
 async def send_uploaded_media(client, chat_id, content: bytes, filename: str,
                               mime_type: str | None = None, kind: str = "file",
                               text: str = "", reply_to_message_id=None,
-                              duration_ms: int | None = None):
-    """Send downloaded Telegram media into a MAX chat as a typed attachment.
+                              duration_ms: int | None = None, post_id=None):
+    """Send downloaded Telegram media into a MAX chat as a typed attachment
+    (as a comment on channel post ``post_id`` when given).
 
     ``mime_type`` is kept for call-site compatibility but unused: PyMax infers
     the type from the filename extension.
@@ -69,6 +70,10 @@ async def send_uploaded_media(client, chat_id, content: bytes, filename: str,
             f"{UPLOAD_SIZE_LIMIT})")
     attachment = _build_attachment(content, filename, kind, duration_ms)
     reply_to = int(reply_to_message_id) if reply_to_message_id is not None else None
+    if post_id is not None:
+        return await client.send_comment(
+            int(chat_id), int(post_id), text or "", reply_to=reply_to,
+            attachments=[attachment])
     return await client.send_message(
         chat_id, text or "", reply_to=reply_to, attachments=[attachment])
 

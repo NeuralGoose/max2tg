@@ -72,6 +72,8 @@ class MaxToTgEditDeps:
     is_channel_chat: Callable[[Any, str, bool], bool]
     media_senders: frozenset[str]
     attaches_parse: Callable[[Any], list]
+    # Re-attaches MAX inline buttons: editing Telegram text drops reply_markup.
+    apply_keyboard: Callable[[Any, Any, Any], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -593,6 +595,8 @@ class MessageSync:
                 self._edit_guard_until[key] = (
                     loop.time() + REACTION_AFTER_EDIT_GUARD_SECONDS
                 )
+                if deps.apply_keyboard is not None:
+                    await deps.apply_keyboard(message, chat_id, max_message_id)
         except Exception:
             _logger.exception(
                 "Failed to mirror MAX edit for chat %s msg %s",

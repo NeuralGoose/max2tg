@@ -11,11 +11,15 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+from pymax.types import ButtonType
+
 import attaches
+import keyboards
 import maxactions
 import mediamax
 import message_content
 import tg
+from comments import CommentMirror, CommentStore
 from formatting import (
     FormattedText,
     build_delivery_formatted,
@@ -62,6 +66,9 @@ _HELP_TEXT = (
     "   +79991234567   ·   @nickname\n\n"
     "✍️ Написать новому человеку — /dm <id> <текст> (id берётся из 🔍):\n"
     "   /dm 21243808 привет\n\n"
+    "💬 Комментарии канала — Reply на пост канала отправляет комментарий; "
+    "/comments (Reply на пост) показывает последние.\n\n"
+    "🗑 Удалить в MAX — /delete в ответ на сообщение.\n\n"
     "⌨️ Ещё: /join <ссылка>, /find <телефон|@ник|id>, /help."
 )
 _WELCOME_TEXT = "👋 Привет! Я зеркалю ваш MAX в Telegram.\n\n" + _HELP_TEXT
@@ -70,6 +77,8 @@ _BOT_COMMANDS = [
     {"command": "join", "description": "Вступить в канал/группу/чат MAX по ссылке"},
     {"command": "find", "description": "Найти человека/канал: телефон, @ник, id"},
     {"command": "dm", "description": "Написать человеку: /dm <id из /find> <текст>"},
+    {"command": "delete", "description": "Удалить в MAX (ответом на сообщение)"},
+    {"command": "comments", "description": "Комментарии к посту канала (ответом на пост)"},
     {"command": "help", "description": "Справка по командам"},
 ]
 
@@ -128,6 +137,17 @@ class MaxToTelegramBridge:
             self._state.path,
         )
         self._links = MessageLinkRegistry(Path(links_path) if links_path else None)
+        self._delete_sync = bool(config.get("sync_delete_enabled", True))
+        self._buttons = keyboards.ButtonStore(self._links.path)
+        self._comments = CommentMirror(
+            store=CommentStore(self._links.path),
+            links=self._links,
+            token=self._token,
+            get_client=lambda: self._client,
+            own_id=lambda: self._own_id,
+            resolve_name=self._resolve_sender_name,
+            poll_interval=int(config.get("comments_poll_interval", 60)),
+        )
         self._bot_id: int | None = None
         # Per-MAX-chat locks serialize topic creation so two concurrent messages
         # from a brand-new chat cannot create duplicate Telegram topics.
@@ -187,6 +207,7 @@ class MaxToTelegramBridge:
             is_channel_chat=self._is_channel_chat,
             media_senders=frozenset(_MEDIA_SENDERS.keys()),
             attaches_parse=attaches.parse,
+            apply_keyboard=self._apply_keyboard,
         )
         self._sync = MessageSync(
             links=self._links,
@@ -303,6 +324,37 @@ class MaxToTelegramBridge:
     async def _after_full_delivery(self, client, chat_id, message_id) -> None:
         self._mark_delivered(chat_id, message_id)
         await self._mark_max_read_if_enabled(client, chat_id, message_id)
+
+    async def _apply_keyboard(self, message, chat_id, max_message_id) -> None:
+        """Show a MAX bot's inline keyboard on the mirrored Telegram message."""
+        if keyboards.inline_keyboard(message) is None:
+            return
+        head = MessageLinkRegistry.head_tg_target(
+            self._links.tg_targets_for_max(chat_id, max_message_id))
+        if head is None:
+            return
+        markup = keyboards.build_reply_markup(
+            message, self._buttons, chat_id, max_message_id)
+        if not markup:
+            return
+        try:
+            await asyncio.to_thread(
+                tg.edit_message_reply_markup, self._token,
+                head["telegram_chat_id"], head["message_id"], markup)
+            return
+        except Exception as exc:
+            # Album items cannot carry buttons: post them as a reply instead.
+            _logger.info("Buttons not attachable to Telegram msg %s (%s); "
+                         "sending them separately", head["message_id"], exc)
+        try:
+            await asyncio.to_thread(
+                tg.send_message, self._token, head["telegram_chat_id"], "⌨️",
+                reply_to_message_id=head["message_id"],
+                message_thread_id=head.get("message_thread_id"),
+                reply_markup=markup)
+        except Exception as exc:
+            _logger.warning("Could not show MAX buttons for %s/%s: %s",
+                            chat_id, max_message_id, exc)
 
     def _mark_max_outbound(self, chat_id, sent_message) -> None:
         """Mark a MAX message we sent (Telegram reply, /dm, etc.) so its echo is not re-forwarded."""
@@ -553,14 +605,15 @@ class MaxToTelegramBridge:
 
     async def _refresh_topic_title(self, max_chat_id, thread_id: int,
                                    title: str, chat_type: str,
-                                   sender: str) -> bool:
+                                   sender: str, *, force: bool = False) -> bool:
         existing = self._state.get_topic(max_chat_id) or {}
         current = str(existing.get("title") or "").strip()
         if not title or title == current or self._is_numeric_title(title):
             return False
         # Normally we don't overwrite an already-good name (respects manual
-        # edits). In resync mode we apply the freshly-resolved name regardless.
-        if not self._resync_titles:
+        # edits). In resync mode, or when MAX itself reports a rename, we apply
+        # the freshly-resolved name regardless.
+        if not (self._resync_titles or force):
             if current and not self._is_numeric_title(current) and not current.startswith("MAX chat "):
                 return False
         try:
@@ -585,6 +638,29 @@ class MaxToTelegramBridge:
         _logger.info("Renamed Telegram topic %s for MAX chat %s to %s",
                      thread_id, max_chat_id, title)
         return True
+
+    async def _on_max_chat_update(self, chat, client) -> None:
+        """MAX pushes the chat on changes (title, members, settings); rename the
+        Telegram topic when a group/channel title changed. Dialog titles come
+        from contact names and are left to preload."""
+        if client is not self._client or not self._topics_enabled:
+            return
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None or self._is_excluded_chat(chat_id):
+            return
+        ctype = getattr(chat, "type", None)
+        chat_type = str(getattr(ctype, "value", ctype) or "").lower()
+        if chat_type in ("", "dialog"):
+            return
+        thread_id = (self._state.get_topic(chat_id) or {}).get("telegram_thread_id")
+        if not thread_id:
+            return
+        title = normalize_topic_title(
+            (getattr(chat, "title", None) or "").strip(), "")
+        if not title:
+            return
+        await self._refresh_topic_title(
+            chat_id, thread_id, title, chat_type, title, force=True)
 
     async def _refresh_topic_icon(self, max_chat_id, thread_id: int) -> bool:
         existing = self._state.get_topic(max_chat_id) or {}
@@ -1697,6 +1773,8 @@ class MaxToTelegramBridge:
                 max_message_id = getattr(message, "id", None)
                 if chat_id is not None and self._is_excluded_chat(chat_id):
                     return
+                if getattr(message, "post_id", None) is not None:
+                    return  # channel comment: mirrored by CommentMirror
                 if (not _allow_redeliver and chat_id is not None
                         and max_message_id is not None):
                     if self._is_delivered(chat_id, max_message_id):
@@ -1739,6 +1817,8 @@ class MaxToTelegramBridge:
                     reply_quote=resolved.reply_quote,
                     reply_parent_max_id=resolved.reply_parent_max_id,
                 )
+                if delivered:
+                    await self._apply_keyboard(message, chat_id, max_message_id)
                 if delivered and fully_delivered:
                     await self._after_full_delivery(
                         client, chat_id, max_message_id,
@@ -1823,7 +1903,7 @@ class MaxToTelegramBridge:
         await self._handle_incoming_message(message, client, _allow_redeliver=True)
 
     async def _on_message_delete(self, event, client) -> None:
-        if client is not self._client:
+        if client is not self._client or not self._delete_sync:
             return
         chat_id = getattr(event, "chat_id", None)
         if chat_id is None:
@@ -1864,18 +1944,26 @@ class MaxToTelegramBridge:
             return
         chat_id = target["chat_id"]
         message_id = target.get("message_id")
+        post_id = target.get("post_id")
         try:
-            # PyMax unifies send/reply: reply_to=None is a plain send.
-            reply_to = int(message_id) if message_id is not None else None
-            sent = await self._client.send_message(chat_id, text, reply_to=reply_to)
-            self._mark_max_outbound(chat_id, sent)
-            max_msg_id = getattr(sent, "id", None)
-            if tg_message_id and max_msg_id is not None:
-                self._remember_tg_sent(
-                    tg_message_id, chat_id, max_msg_id,
-                    telegram_chat_id=telegram_chat_id,
-                    message_thread_id=thread_id,
+            if post_id is not None:
+                await self._comments.send_from_telegram(
+                    chat_id, post_id, text, reply_to_comment=message_id,
+                    tg_message_id=tg_message_id,
                 )
+            else:
+                # PyMax unifies send/reply: reply_to=None is a plain send.
+                reply_to = int(message_id) if message_id is not None else None
+                sent = await self._client.send_message(
+                    chat_id, text, reply_to=reply_to)
+                self._mark_max_outbound(chat_id, sent)
+                max_msg_id = getattr(sent, "id", None)
+                if tg_message_id and max_msg_id is not None:
+                    self._remember_tg_sent(
+                        tg_message_id, chat_id, max_msg_id,
+                        telegram_chat_id=telegram_chat_id,
+                        message_thread_id=thread_id,
+                    )
         except Exception as exc:
             _logger.warning("Could not send Telegram reply to MAX chat %s: %s",
                             chat_id, exc)
@@ -2016,10 +2104,16 @@ class MaxToTelegramBridge:
                     text=caption,
                     reply_to_message_id=target.get("message_id"),
                     duration_ms=attachment.get("duration_ms"),
+                    post_id=target.get("post_id"),
                 )
-                self._mark_max_outbound(target["chat_id"], sent)
                 max_msg_id = getattr(sent, "id", None)
-                if tg_message_id and max_msg_id is not None:
+                if target.get("post_id") is not None:
+                    self._comments.record_sent(
+                        tg_message_id, target["chat_id"], target["post_id"], sent)
+                else:
+                    self._mark_max_outbound(target["chat_id"], sent)
+                if (target.get("post_id") is None and tg_message_id
+                        and max_msg_id is not None):
                     self._remember_tg_sent(
                         tg_message_id, target["chat_id"], max_msg_id,
                         telegram_chat_id=telegram_chat_id,
@@ -2189,6 +2283,168 @@ class MaxToTelegramBridge:
         sender = (message.get("from") or {}).get("id")
         return str(sender) in owner_ids
 
+    def _allowed_chat_ids(self) -> set[str]:
+        allowed = {str(self._chat_id), str(self._fallback_chat_id)}
+        if self._forum_chat_id:
+            allowed.add(str(self._forum_chat_id))
+        return allowed
+
+    def _is_channel_max_chat(self, max_chat_id) -> bool:
+        topic = self._state.get_topic(max_chat_id) or {}
+        return topic.get("chat_type") == "channel"
+
+    def _max_target_for_reply(self, message: dict) -> dict | None:
+        """Where a Telegram reply goes in MAX. Replies to mirrored channel posts
+        and comments become comments (``post_id``) instead of channel posts."""
+        reply_id = (message.get("reply_to_message") or {}).get("message_id")
+        comment = self._comments.store.comment_for_tg(reply_id)
+        if comment:
+            return {
+                "chat_id": int(comment["max_chat_id"]),
+                "message_id": int(comment["comment_id"]),
+                "post_id": int(comment["post_id"]),
+                "sender": "комментарии",
+                "telegram_chat_id": message.get("chat", {}).get("id"),
+                "message_thread_id": message.get("message_thread_id"),
+            }
+        target = self._links.reply_target_for_tg(reply_id)
+        if target and self._is_channel_max_chat(target["chat_id"]):
+            target = {**target, "post_id": target["message_id"], "message_id": None,
+                      "sender": "комментарии"}
+        return target
+
+    async def _handle_callback_query(self, query: dict) -> None:
+        """A press on a mirrored MAX bot button."""
+        query_id = query.get("id")
+        data = query.get("data") or ""
+
+        async def answer(text: str | None = None) -> None:
+            try:
+                await asyncio.to_thread(
+                    tg.answer_callback_query, self._token, query_id, text)
+            except Exception as exc:
+                _logger.debug("answerCallbackQuery failed: %s", exc)
+
+        if not data.startswith(keyboards.CALLBACK_PREFIX):
+            await answer()
+            return
+        chat = ((query.get("message") or {}).get("chat") or {}).get("id")
+        if (str(chat) not in self._allowed_chat_ids()
+                or not self._is_authorized_commander(query, chat)):
+            await answer("Нет доступа")
+            return
+        button = self._buttons.get(data[len(keyboards.CALLBACK_PREFIX):])
+        if button is None:
+            await answer("Кнопка устарела")
+            return
+        client = self._client
+        if client is None:
+            await answer("MAX сейчас не подключён")
+            return
+        try:
+            if button["button_type"] == "MESSAGE":
+                await client.send_message(int(button["max_chat_id"]), button["text"])
+            else:
+                await client.send_callback(
+                    button["callback_id"], ButtonType.CALLBACK, button["payload"])
+        except Exception as exc:
+            _logger.warning("MAX button press failed (chat %s msg %s): %s",
+                            button["max_chat_id"], button["max_message_id"], exc)
+            await answer(f"Ошибка MAX: {exc}")
+            return
+        _logger.info("Relayed Telegram button press to MAX chat %s msg %s",
+                     button["max_chat_id"], button["max_message_id"])
+        await answer()
+
+    async def _delete_in_max(self, client, max_chat_id, max_message_id) -> bool:
+        """Delete for everyone; fall back to deleting just for us (e.g. someone
+        else's message without admin rights). Returns True if for everyone."""
+        try:
+            if await client.delete_message(
+                    int(max_chat_id), [int(max_message_id)], for_me=False):
+                return True
+        except Exception as exc:
+            _logger.info("MAX delete for everyone failed (%s/%s): %s",
+                         max_chat_id, max_message_id, exc)
+        await client.delete_message(
+            int(max_chat_id), [int(max_message_id)], for_me=True)
+        return False
+
+    async def _handle_delete_command(self, message: dict, incoming_chat) -> None:
+        """/delete as a reply: delete the linked MAX message (or comment) and
+        its Telegram copies. The Bot API never reports deletions made in
+        Telegram, so this is the Telegram → MAX delete path."""
+        thread_id = message.get("message_thread_id")
+        reply_id = (message.get("reply_to_message") or {}).get("message_id")
+        if not self._delete_sync:
+            await self._send_note(incoming_chat, "🗑 Удаление в MAX отключено "
+                                  "(MAX2TG_SYNC_DELETE_ENABLED).", thread_id)
+            return
+        comment = self._comments.store.comment_for_tg(reply_id)
+        target = None if comment else self._links.max_target_for_tg(reply_id)
+        if not comment and not target:
+            await self._send_note(
+                incoming_chat, "ℹ️ Ответьте /delete на сообщение, пересланное "
+                "из MAX или отправленное в MAX.", thread_id)
+            return
+        client = self._client
+        if client is None:
+            await self._send_note(incoming_chat, "⏳ MAX ещё подключается — "
+                                  "попробуйте через минуту.", thread_id)
+            return
+        for_everyone = True
+        try:
+            if comment:
+                await client.delete_comment(
+                    int(comment["max_chat_id"]), int(comment["post_id"]),
+                    [int(comment["comment_id"])])
+                tg_ids = [
+                    (incoming_chat, tid) for tid in self._comments.store.remove_comment(
+                        comment["max_chat_id"], comment["comment_id"])
+                ]
+            else:
+                chat_id, mid = target["max_chat_id"], target["max_message_id"]
+                for_everyone = await self._delete_in_max(client, chat_id, mid)
+                tg_ids = [(e["telegram_chat_id"], e["message_id"])
+                          for e in self._links.tg_targets_for_max(chat_id, mid)]
+                self._links.remove_max(chat_id, mid)
+        except Exception as exc:
+            _logger.warning("Telegram /delete failed for msg %s: %s", reply_id, exc)
+            await self._send_note(incoming_chat, f"Не удалось удалить в MAX: {exc}",
+                                  thread_id)
+            return
+        _logger.info("Deleted in MAX via /delete (Telegram msg %s, for_everyone=%s)",
+                     reply_id, for_everyone)
+        for tg_chat, tg_id in [*tg_ids, (incoming_chat, message.get("message_id"))]:
+            try:
+                await asyncio.to_thread(tg.delete_message, self._token, tg_chat, tg_id)
+            except Exception as exc:
+                _logger.debug("Could not delete Telegram msg %s: %s", tg_id, exc)
+        if not for_everyone:
+            await self._send_note(
+                incoming_chat, "🗑 Удалено только у вас: удалить для всех в MAX "
+                "нельзя (чужое сообщение).", thread_id)
+
+    async def _handle_comments_command(self, message: dict, incoming_chat) -> None:
+        """/comments as a reply to a channel post: show its latest comments and
+        keep mirroring new ones."""
+        thread_id = message.get("message_thread_id")
+        target = self._max_target_for_reply(message)
+        if not target or target.get("post_id") is None:
+            await self._send_note(incoming_chat, "ℹ️ Ответьте /comments на пост "
+                                  "канала.", thread_id)
+            return
+        try:
+            shown = await self._comments.show_recent(
+                target["chat_id"], target["post_id"])
+        except Exception as exc:
+            await self._send_note(incoming_chat,
+                                  f"Не удалось получить комментарии: {exc}", thread_id)
+            return
+        if not shown:
+            await self._send_note(incoming_chat, "💬 Комментариев пока нет — новые "
+                                  "появятся здесь.", thread_id)
+
     async def _handle_update(self, update: dict) -> None:
         if update.get("edited_message"):
             await self._handle_edited_message(update["edited_message"])
@@ -2201,21 +2457,28 @@ class MaxToTelegramBridge:
                 update["message_reaction_count"],
             )
             return
+        if update.get("callback_query"):
+            await self._handle_callback_query(update["callback_query"])
+            return
         message = update.get("message")
         if not message:
             return
         # Only accept commands from the configured owner chat (tolerate the id
         # being stored/sent as int vs str).
         incoming_chat = message.get("chat", {}).get("id")
-        allowed_chats = {str(self._chat_id), str(self._fallback_chat_id)}
-        if self._forum_chat_id:
-            allowed_chats.add(str(self._forum_chat_id))
-        if str(incoming_chat) not in allowed_chats:
+        if str(incoming_chat) not in self._allowed_chat_ids():
             return
         text = self._telegram_outgoing_text(message)
         if text.startswith("/"):
             if not self._is_authorized_commander(message, incoming_chat):
                 _logger.warning("Ignoring /command from non-owner in forum chat.")
+                return
+            cmd = text.split(maxsplit=1)[0].lower().lstrip("/").split("@", 1)[0]
+            if cmd == "delete":
+                await self._handle_delete_command(message, incoming_chat)
+                return
+            if cmd == "comments":
+                await self._handle_comments_command(message, incoming_chat)
                 return
             await self._handle_command(
                 incoming_chat, message.get("message_thread_id"), text)
@@ -2225,10 +2488,7 @@ class MaxToTelegramBridge:
         if not text and not self._telegram_attachment(message):
             return
         reply = message.get("reply_to_message")
-        target = (
-            self._links.reply_target_for_tg(reply.get("message_id"))
-            if reply else None
-        )
+        target = self._max_target_for_reply(message) if reply else None
         if target:
             await self._send_telegram_update_to_max(target, message)
             return
@@ -2395,6 +2655,7 @@ class MaxToTelegramBridge:
             _logger.warning("Could not fetch Telegram bot id: %s", exc)
         _logger.info("Bridge online (own id: %s).", self._own_id)
         self._sync.start_sweeper()
+        self._comments.start()
         await self._warn_if_max_client_outdated(client)
         await self._warn_forum_admin_if_needed()
         try:
@@ -2427,6 +2688,7 @@ class MaxToTelegramBridge:
         client.on_message_edit()(self._on_message_edit)
         client.on_message_delete()(self._on_message_delete)
         client.on_reaction_update()(self._sync.on_max_reaction)
+        client.on_chat_update()(self._on_max_chat_update)
         client.on_start()(self._on_start)
         client.on_disconnect()(self._on_max_disconnect)
         self._client = client

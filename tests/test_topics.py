@@ -512,6 +512,7 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                 text="",
                 reply_to_message_id=None,
                 duration_ms=None,
+                post_id=None,
             )
 
     def test_telegram_voice_and_video_note_keep_kind_and_duration(self):
