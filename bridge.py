@@ -7,6 +7,7 @@ message in Telegram, the reply text is sent back to the originating MAX chat.
 import asyncio
 import logging
 import re
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -36,6 +37,9 @@ _logger = logging.getLogger(__name__)
 
 RECONNECT_DELAY_SECONDS = 15
 RECONNECT_MAX_DELAY = 300
+# Tell the admin in Telegram once MAX has been unreachable this long; shorter
+# blips (network hiccups, server restarts) reconnect silently.
+MAX_DOWN_ALERT_SECONDS = 300
 NAME_CACHE_LIMIT = 5000
 # Bound the per-chat topic-lock map so a long-running bridge over many chats
 # does not grow it without limit.
@@ -140,6 +144,13 @@ class MaxToTelegramBridge:
             self._config.get("telegram_exclude_chat_ids") or {0},
         )
         self._forum_icon_sticker_ids_cache: list[str] | None = None
+        # MAX connection health: when it went down, the pending admin alert, and
+        # whether the alert went out (so the recovery is announced too).
+        self._max_down_since: float | None = None
+        self._max_down_reason: str | None = None
+        self._max_down_alert_task: "asyncio.Task | None" = None
+        self._max_down_alerted = False
+        self._update_alert_sent = False
         tg.set_api_min_interval(
             float(config.get("telegram_api_min_interval_seconds") or 0.05),
         )
@@ -2264,8 +2275,77 @@ class MaxToTelegramBridge:
         start_offset = self._auth_poll.offset if self._auth_poll else None
         self._tg_poll_task = asyncio.create_task(self._poll_telegram(start_offset))
 
+    async def _notify_admin(self, text: str) -> None:
+        await self._send_note(self._chat_id, text, None)
+
+    def _note_max_down(self, exc: BaseException | str) -> None:
+        """Record a MAX outage; the admin is alerted only if it persists."""
+        reason = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
+        self._max_down_reason = reason[:300]
+        if self._max_down_since is not None:
+            return
+        self._max_down_since = time.monotonic()
+        self._max_down_alert_task = asyncio.create_task(
+            self._alert_if_max_stays_down())
+
+    async def _alert_if_max_stays_down(self) -> None:
+        await asyncio.sleep(MAX_DOWN_ALERT_SECONDS)
+        if self._max_down_since is None:
+            return
+        minutes = int((time.monotonic() - self._max_down_since) // 60)
+        _logger.error("MAX unreachable for %d min: %s", minutes,
+                      self._max_down_reason)
+        self._max_down_alerted = True
+        await self._notify_admin(
+            f"⚠️ MAX недоступен уже {minutes} мин — мост не получает сообщения.\n"
+            f"Последняя ошибка: {self._max_down_reason}\n"
+            "Если это не временный сбой сети, проверьте свежую версию "
+            "maxapi-python (PyMax): MAX мог сменить адрес или протокол.")
+
+    async def _note_max_up(self) -> None:
+        task = self._max_down_alert_task
+        self._max_down_alert_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        since, alerted = self._max_down_since, self._max_down_alerted
+        self._max_down_since = None
+        self._max_down_reason = None
+        self._max_down_alerted = False
+        if alerted and since is not None:
+            minutes = int((time.monotonic() - since) // 60)
+            _logger.info("MAX connection restored after %d min.", minutes)
+            await self._notify_admin(
+                f"✅ Соединение с MAX восстановлено (простой ~{minutes} мин).")
+
+    async def _on_max_disconnect(self, exc, reconnect, delay) -> None:
+        """PyMax fires this on every lost connection / failed reconnect."""
+        _logger.warning("MAX connection lost (%s); reconnect=%s in %ss",
+                        exc, reconnect, delay)
+        self._note_max_down(exc)
+
+    async def _warn_if_max_client_outdated(self, client) -> None:
+        """MAX flags outdated client versions in the handshake; such versions
+        may soon be refused, so tell the admin once per process."""
+        if self._update_alert_sent:
+            return
+        try:
+            outdated = client.is_update_available()
+        except Exception as exc:
+            _logger.debug("MAX update check failed: %s", exc)
+            return
+        if outdated is not True:
+            return
+        self._update_alert_sent = True
+        _logger.warning("MAX reports the client version is outdated; "
+                        "update maxapi-python.")
+        await self._notify_admin(
+            "ℹ️ MAX сообщает, что версия клиента устарела. Обновите "
+            "maxapi-python (PyMax), иначе MAX может перестать принимать "
+            "подключение.")
+
     async def _on_start(self, client) -> None:
         """PyMax fires this after a successful (re)connect + login."""
+        await self._note_max_up()
         me = getattr(client, "me", None)
         contact = getattr(me, "contact", None)
         self._own_id = getattr(contact, "id", None)
@@ -2276,6 +2356,7 @@ class MaxToTelegramBridge:
         except Exception as exc:
             _logger.warning("Could not fetch Telegram bot id: %s", exc)
         _logger.info("Bridge online (own id: %s).", self._own_id)
+        await self._warn_if_max_client_outdated(client)
         await self._warn_forum_admin_if_needed()
         try:
             await self._preload_topics(client)
@@ -2308,6 +2389,7 @@ class MaxToTelegramBridge:
         client.on_message_delete()(self._on_message_delete)
         client.on_raw()(self._sync.on_max_raw)
         client.on_start()(self._on_start)
+        client.on_disconnect()(self._on_max_disconnect)
         self._client = client
         try:
             # start() connects, authenticates, and listens until the connection
@@ -2328,8 +2410,10 @@ class MaxToTelegramBridge:
             started = loop.time()
             try:
                 await self._run_session()
+                self._note_max_down("MAX client stopped")
             except Exception as exc:
                 _logger.error("MAX session error: %s", exc)
+                self._note_max_down(exc)
             # A session that stayed up a while resets the backoff; rapid repeated
             # failures (e.g. a revoked token) escalate the delay and warn the user.
             if loop.time() - started > 120:
@@ -2342,6 +2426,10 @@ class MaxToTelegramBridge:
                               "token/credentials are likely invalid.", failures)
                 print("⚠️ MAX не удаётся подключиться — проверьте токен/доступ "
                       "и перезапустите.")
+                await self._notify_admin(
+                    f"⚠️ MAX не удаётся запустить {failures} раз подряд — "
+                    "проверьте токен/доступ и перезапустите мост.\n"
+                    f"Последняя ошибка: {self._max_down_reason}")
             _logger.info("Reconnecting in %s seconds...", delay)
             await asyncio.sleep(delay)
 
