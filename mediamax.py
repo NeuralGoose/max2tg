@@ -14,7 +14,7 @@ for video notes, whose response is only a rendition map).
 """
 from pathlib import PurePosixPath
 
-from pymax import File, Photo, Video
+from pymax import File, Photo, Video, VideoNote, Voice
 
 # Defensive ceiling for Telegram -> MAX uploads. The content is already bounded
 # by the Telegram download path, but cap here too so a malformed/huge payload is
@@ -29,11 +29,24 @@ def _safe_name(name: str | None) -> str:
     return base or "file"
 
 
-def _build_attachment(content: bytes, filename: str, kind: str):
-    """Wrap raw bytes in the right PyMax send-attachment type for the kind."""
+def _build_attachment(content: bytes, filename: str, kind: str,
+                      duration_ms: int | None = None):
+    """Wrap raw bytes in the right PyMax send-attachment type for the kind.
+
+    Voice messages and video notes need a duration (PyMax can only detect it
+    with its optional ``video`` extra); without one they go as a file / video.
+    """
     filename = _safe_name(filename)
     if kind == "photo":
         return Photo(content, name=filename)
+    if kind == "voice":
+        if duration_ms:
+            return Voice(content, name=filename, duration=duration_ms)
+        return File(content, name=filename)
+    if kind == "video_note":
+        if duration_ms:
+            return VideoNote(content, name=filename, duration=duration_ms)
+        return Video(content, name=filename)
     if kind == "video":
         return Video(content, name=filename)
     return File(content, name=filename)
@@ -41,7 +54,8 @@ def _build_attachment(content: bytes, filename: str, kind: str):
 
 async def send_uploaded_media(client, chat_id, content: bytes, filename: str,
                               mime_type: str | None = None, kind: str = "file",
-                              text: str = "", reply_to_message_id=None):
+                              text: str = "", reply_to_message_id=None,
+                              duration_ms: int | None = None):
     """Send downloaded Telegram media into a MAX chat as a typed attachment.
 
     ``mime_type`` is kept for call-site compatibility but unused: PyMax infers
@@ -53,10 +67,10 @@ async def send_uploaded_media(client, chat_id, content: bytes, filename: str,
         raise ValueError(
             f"media too large to upload to MAX ({len(content)} bytes > "
             f"{UPLOAD_SIZE_LIMIT})")
-    attachment = _build_attachment(content, filename, kind)
+    attachment = _build_attachment(content, filename, kind, duration_ms)
+    reply_to = int(reply_to_message_id) if reply_to_message_id is not None else None
     return await client.send_message(
-        chat_id, text or "", reply_to=reply_to_message_id,
-        attachments=[attachment])
+        chat_id, text or "", reply_to=reply_to, attachments=[attachment])
 
 
 async def resolve_file_url(client, file_id, chat_id, message_id) -> str:

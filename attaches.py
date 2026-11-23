@@ -2,8 +2,8 @@
 
 PyMax delivers attachments as typed Pydantic models on ``Message.attaches``
 (PhotoAttachment, VideoAttachment, FileAttachment, StickerAttachment,
-AudioAttachment, ShareAttachment, ContactAttachment, CallAttachment, and
-UnknownAttachment for anything else). ``parse()`` turns those into the flat
+AudioAttachment, ShareAttachment, ContactAttachment, CallAttachment,
+PollAttachment, and UnknownAttachment for anything else). ``parse()`` turns those into the flat
 ``ParsedAttach`` items the bridge forwards to Telegram.
 
 Photos/stickers/audio usually carry a direct CDN URL. Videos and files never
@@ -27,6 +27,7 @@ class ParsedAttach:
     file_id: int | str | None = None   # for file_resolve (resolve to a URL)
     video_id: int | str | None = None  # for video_resolve
     size: int | None = None            # bytes, when known (upload-limit checks)
+    video_note: bool = False           # video_resolve of a round video message
 
 
 def _safe_filename(name: object) -> str:
@@ -106,8 +107,31 @@ def _attach_kind(attach) -> str:
     return str(value).upper()
 
 
+# MAX ``videoType`` codes: 0 regular video, 1 video message (circle), 2 story.
+_VIDEO_TYPE_NOTE = 1
+
+
 def _http_url(value) -> str | None:
     return value if isinstance(value, str) and value.startswith("http") else None
+
+
+def _poll_text(attach) -> str:
+    """Render a MAX poll as text: question, then numbered answers with votes."""
+    title = _attach_field(attach, "title") or ""
+    state = _attach_field(attach, "state")
+    results = _attach_field(state, "result") if state is not None else None
+    votes: dict = {}
+    for result in results or []:
+        answer_id = _attach_field(result, "answer_id", "answerId")
+        count = _to_int(_attach_field(result, "vote_count", "voteCount"))
+        if answer_id is not None and count is not None:
+            votes[answer_id] = count
+    lines = [f"📊 Опрос: {title}".rstrip()]
+    for n, answer in enumerate(_attach_field(attach, "answers") or [], 1):
+        text = _attach_field(answer, "text") or ""
+        count = votes.get(_attach_field(answer, "answer_id", "answerId"))
+        lines.append(f"{n}. {text}" + (f" — {count}" if count else ""))
+    return "\n".join(lines)
 
 
 def _parse_one(attach) -> ParsedAttach | None:
@@ -128,9 +152,13 @@ def _parse_one(attach) -> ParsedAttach | None:
 
     if kind == "VIDEO":
         video_id = _attach_field(attach, "video_id", "videoId")
+        is_note = _to_int(_attach_field(
+            attach, "video_type", "videoType")) == _VIDEO_TYPE_NOTE
+        label = "⭕ Видеосообщение" if is_note else "🎞 Видео"
         if video_id is not None:
-            return ParsedAttach("video_resolve", "🎞 Видео", video_id=video_id)
-        return ParsedAttach("note", "🎞 Видео — открыть в MAX")
+            return ParsedAttach("video_resolve", label, video_id=video_id,
+                                video_note=is_note)
+        return ParsedAttach("note", f"{label} — открыть в MAX")
 
     if kind == "AUDIO":
         url = _http_url(_attach_field(attach, "url"))
@@ -166,6 +194,9 @@ def _parse_one(attach) -> ParsedAttach | None:
 
     if kind == "CALL":
         return ParsedAttach("note", "📞 Звонок")
+
+    if kind == "POLL":
+        return ParsedAttach("note", _poll_text(attach))
 
     # CONTROL / INLINE_KEYBOARD are service/UI attachments — nothing to show.
     if kind in ("CONTROL", "INLINE_KEYBOARD", ""):

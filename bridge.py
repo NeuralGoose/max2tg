@@ -1570,6 +1570,21 @@ class MaxToTelegramBridge:
             )
         return True, msg_id, ok
 
+    async def _send_video_note(self, telegram_chat_id, url, thread_id):
+        """Send a MAX circle as a Telegram video note; Telegram rejects
+        non-square or over-long clips, so fall back to a regular video."""
+        try:
+            return await asyncio.to_thread(
+                tg.send_video_note, self._token, telegram_chat_id, url,
+                message_thread_id=thread_id)
+        except tg.RateLimitError:
+            raise
+        except Exception as exc:
+            _logger.info("sendVideoNote failed (%s); sending as video", exc)
+            return await asyncio.to_thread(
+                tg.send_video, self._token, telegram_chat_id, url, None,
+                message_thread_id=thread_id)
+
     async def _send_resolved_item(
         self,
         item,
@@ -1620,10 +1635,27 @@ class MaxToTelegramBridge:
             else:  # video_resolve
                 url = await mediamax.resolve_video_url(
                     client, item.video_id, chat_id, max_message_id)
-                msg_id = await asyncio.to_thread(
-                    tg.send_video, self._token, telegram_chat_id, url, caption,
-                    message_thread_id=thread_id,
-                    caption_entities=caption_entities)
+                if item.video_note:
+                    if caption:
+                        # Telegram video notes take no caption: send it first.
+                        text_id = await asyncio.to_thread(
+                            tg.send_message, self._token, telegram_chat_id,
+                            caption, message_thread_id=thread_id,
+                            entities=caption_entities)
+                        if remember and text_id:
+                            self._remember(
+                                text_id, chat_id, max_message_id, sender,
+                                telegram_chat_id, thread_id,
+                                forward_role="text", link_source=link_source,
+                            )
+                        caption = caption_entities = None
+                    msg_id = await self._send_video_note(
+                        telegram_chat_id, url, thread_id)
+                else:
+                    msg_id = await asyncio.to_thread(
+                        tg.send_video, self._token, telegram_chat_id, url,
+                        caption, message_thread_id=thread_id,
+                        caption_entities=caption_entities)
         except Exception as exc:
             _logger.warning("Failed to resolve/send %s: %s", item.kind, exc)
             note = f"{caption} — открыть в MAX" if caption else "открыть в MAX"
@@ -1832,7 +1864,8 @@ class MaxToTelegramBridge:
         message_id = target.get("message_id")
         try:
             # PyMax unifies send/reply: reply_to=None is a plain send.
-            sent = await self._client.send_message(chat_id, text, reply_to=message_id)
+            reply_to = int(message_id) if message_id is not None else None
+            sent = await self._client.send_message(chat_id, text, reply_to=reply_to)
             self._mark_max_outbound(chat_id, sent)
             max_msg_id = getattr(sent, "id", None)
             if tg_message_id and max_msg_id is not None:
@@ -1921,17 +1954,19 @@ class MaxToTelegramBridge:
         for key, fallback_name, fallback_mime, kind in (
             ("animation", "telegram-animation.mp4", "video/mp4", "video"),
             ("video", "telegram-video.mp4", "video/mp4", "video"),
-            ("voice", "telegram-voice.ogg", "audio/ogg", "file"),
+            ("voice", "telegram-voice.ogg", "audio/ogg", "voice"),
             ("audio", "telegram-audio.mp3", "audio/mpeg", "file"),
-            ("video_note", "telegram-video-note.mp4", "video/mp4", "video"),
+            ("video_note", "telegram-video-note.mp4", "video/mp4", "video_note"),
         ):
             item = message.get(key)
             if item:
+                duration = item.get("duration")
                 return {
                     "file_id": item.get("file_id"),
                     "filename": item.get("file_name") or fallback_name,
                     "mime_type": item.get("mime_type") or fallback_mime,
                     "kind": kind,
+                    "duration_ms": int(duration) * 1000 if duration else None,
                 }
         return None
 
@@ -1978,6 +2013,7 @@ class MaxToTelegramBridge:
                     kind=attachment.get("kind", "file"),
                     text=caption,
                     reply_to_message_id=target.get("message_id"),
+                    duration_ms=attachment.get("duration_ms"),
                 )
                 self._mark_max_outbound(target["chat_id"], sent)
                 max_msg_id = getattr(sent, "id", None)

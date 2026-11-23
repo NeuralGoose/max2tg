@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 import attaches
+from pymax.types.domain.attachments.poll import PollAttachment
 
 
 def _attach(type_value, **fields):
@@ -52,6 +53,42 @@ class ParseTypedTests(unittest.TestCase):
         item = self._one(_attach("VIDEO", video_id=4242))
         self.assertEqual(item.kind, "video_resolve")
         self.assertEqual(item.video_id, 4242)
+        self.assertFalse(item.video_note)
+
+    def test_video_type_1_is_video_note(self):
+        item = self._one(_attach("VIDEO", video_id=4242, video_type=1))
+        self.assertEqual(item.kind, "video_resolve")
+        self.assertTrue(item.video_note)
+        self.assertIn("Видеосообщение", item.text)
+
+    def test_embedded_forward_video_note(self):
+        item = self._one({"_type": "VIDEO", "videoId": 5, "videoType": 1})
+        self.assertTrue(item.video_note)
+
+    def test_typed_poll_rendered_as_text(self):
+        poll = PollAttachment.model_validate({
+            "_type": "POLL",
+            "title": "Куда идём?",
+            "answers": [{"text": "Кино", "answerId": 1},
+                        {"text": "Парк", "answerId": 2}],
+            "settings": 0,
+            "pollId": 9,
+            "version": 1,
+            "state": {"total": 3, "voterPreviewIds": [],
+                      "result": [{"answerId": 1, "voteCount": 2, "votes": [],
+                                  "rate": 66, "options": 0},
+                                 {"answerId": 2, "voteCount": 1, "votes": [],
+                                  "rate": 33, "options": 0}]},
+        })
+        item = self._one(poll)
+        self.assertEqual(item.kind, "note")
+        self.assertEqual(
+            item.text, "📊 Опрос: Куда идём?\n1. Кино — 2\n2. Парк — 1")
+
+    def test_poll_dict_without_votes(self):
+        item = self._one({"_type": "POLL", "title": "Да?",
+                          "answers": [{"text": "Да"}, {"text": "Нет"}]})
+        self.assertEqual(item.text, "📊 Опрос: Да?\n1. Да\n2. Нет")
 
     def test_audio_with_url_is_voice(self):
         item = self._one(_attach("AUDIO", url="https://cdn/a.ogg", duration=5000))

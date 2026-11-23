@@ -73,6 +73,44 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(send.call_args.kwargs["message_thread_id"], 42)
             self.assertIsNotNone(bridge._links.reply_target_for_tg(10))
 
+    def _circle_client(self):
+        client = self._client()
+        client.get_video_by_id = AsyncMock(
+            return_value=SimpleNamespace(url="https://cdn/circle.mp4"))
+        circle = SimpleNamespace(type="VIDEO", video_id=7, video_type=1)
+        return client, _message(attaches=[circle])
+
+    async def test_max_circle_sent_as_telegram_video_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client, message = self._circle_client()
+            bridge._client = client
+            with patch("bridge.tg.create_forum_topic", return_value=42), \
+                    patch("bridge.tg.send_message", return_value=10) as send, \
+                    patch("bridge.tg.send_video_note", return_value=11) as note, \
+                    patch("bridge.tg.send_video") as video:
+                await bridge._on_message(message, client)
+            note.assert_called_once()
+            self.assertEqual(note.call_args.args[2], "https://cdn/circle.mp4")
+            video.assert_not_called()
+            # The sender caption can't ride on a video note: sent as text first.
+            send.assert_called_once()
+            self.assertIn("Иван Петров", send.call_args.args[2])
+            self.assertIsNotNone(bridge._links.reply_target_for_tg(11))
+
+    async def test_max_circle_falls_back_to_video_when_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._bridge(tmp)
+            client, message = self._circle_client()
+            bridge._client = client
+            with patch("bridge.tg.create_forum_topic", return_value=42), \
+                    patch("bridge.tg.send_message", return_value=10), \
+                    patch("bridge.tg.send_video_note",
+                          side_effect=RuntimeError("VIDEO_NOTE_INVALID")), \
+                    patch("bridge.tg.send_video", return_value=12) as video:
+                await bridge._on_message(message, client)
+            video.assert_called_once()
+
     async def test_forwards_own_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)

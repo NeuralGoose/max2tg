@@ -41,5 +41,20 @@ class SendPhotoBytesTests(unittest.TestCase):
             self.assertIsNone(tg.send_photo_bytes("TOK", 555, b"x"))
 
 
+class SendVideoNoteTests(unittest.TestCase):
+    def test_downloads_then_uploads_without_caption(self):
+        with patch.object(tg, "_download", return_value=b"MP4") as download, \
+                patch.object(tg, "_call_upload",
+                             return_value={"message_id": 7}) as upload:
+            mid = tg.send_video_note("TOK", 555, "https://cdn/c.mp4",
+                                     message_thread_id=42)
+        self.assertEqual(mid, 7)
+        download.assert_called_once_with("https://cdn/c.mp4")
+        args, kwargs = upload.call_args
+        self.assertEqual(args[1], "sendVideoNote")
+        self.assertEqual(args[2], {"video_note": ("video_note.mp4", b"MP4")})
+        self.assertEqual(kwargs, {"chat_id": 555, "message_thread_id": 42})
+
+
 if __name__ == "__main__":
     unittest.main()

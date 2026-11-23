@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import mediamax
-from pymax import File, Photo, Video
+from pymax import File, Photo, Video, VideoNote, Voice
 from pymax.types.domain.attachments.video import VideoRequest
 
 
@@ -43,6 +43,32 @@ class SendUploadedMediaTests(unittest.IsolatedAsyncioTestCase):
         attachment = client.send_message.await_args.kwargs["attachments"][0]
         self.assertIsInstance(attachment, File)
         self.assertEqual(attachment.name, "report.pdf")
+
+    async def test_voice_with_duration_builds_voice_attachment(self):
+        client = self._client()
+        await mediamax.send_uploaded_media(
+            client, 555, b"ogg", "telegram-voice.ogg", kind="voice",
+            duration_ms=7000)
+        attachment = client.send_message.await_args.kwargs["attachments"][0]
+        self.assertIsInstance(attachment, Voice)
+        self.assertEqual(attachment.duration, 7000)
+
+    async def test_voice_without_duration_falls_back_to_file(self):
+        client = self._client()
+        await mediamax.send_uploaded_media(
+            client, 555, b"ogg", "telegram-voice.ogg", kind="voice")
+        attachment = client.send_message.await_args.kwargs["attachments"][0]
+        self.assertIsInstance(attachment, File)
+        self.assertNotIsInstance(attachment, Voice)
+
+    async def test_video_note_with_duration_builds_video_note(self):
+        client = self._client()
+        await mediamax.send_uploaded_media(
+            client, 555, b"mp4", "telegram-video-note.mp4", kind="video_note",
+            duration_ms=12000, reply_to_message_id="42")
+        kwargs = client.send_message.await_args.kwargs
+        self.assertIsInstance(kwargs["attachments"][0], VideoNote)
+        self.assertEqual(kwargs["reply_to"], 42)
 
     async def test_no_reply_defaults_to_none_and_empty_text(self):
         client = self._client()

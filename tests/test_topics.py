@@ -511,7 +511,21 @@ class BridgeTopicTests(unittest.IsolatedAsyncioTestCase):
                 kind="file",
                 text="",
                 reply_to_message_id=None,
+                duration_ms=None,
             )
+
+    def test_telegram_voice_and_video_note_keep_kind_and_duration(self):
+        bridge = self.make_bridge()
+        voice = bridge._telegram_attachment({
+            "voice": {"file_id": "v1", "duration": 7, "mime_type": "audio/ogg"}
+        })
+        note = bridge._telegram_attachment({
+            "video_note": {"file_id": "n1", "duration": 12}
+        })
+        self.assertEqual(voice["kind"], "voice")
+        self.assertEqual(voice["duration_ms"], 7000)
+        self.assertEqual(note["kind"], "video_note")
+        self.assertEqual(note["duration_ms"], 12000)
 
     def test_telegram_sticker_attachment_metadata(self):
         bridge = self.make_bridge()

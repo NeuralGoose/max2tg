@@ -642,6 +642,19 @@ def send_voice(token, chat_id, url, caption=None,
                        caption_entities=caption_entities)
 
 
+def send_video_note(token, chat_id, url,
+                    message_thread_id: int | None = None) -> int | None:
+    """Send a round video note. Telegram accepts video notes only as uploaded
+    bytes (not by URL) and without a caption, so download first."""
+    content = _download(url)
+    params: dict = {"chat_id": chat_id}
+    if message_thread_id:
+        params["message_thread_id"] = message_thread_id
+    files = {"video_note": ("video_note.mp4", content)}
+    result = _call_upload(token, "sendVideoNote", files, **params)
+    return result.get("message_id")
+
+
 def send_audio(token, chat_id, url, caption=None,
                message_thread_id: int | None = None,
                caption_entities: list[dict] | None = None) -> int | None:
