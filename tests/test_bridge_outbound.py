@@ -208,7 +208,7 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
         }}
         await bridge._handle_update(update)
         bridge._client.add_reaction.assert_awaited_once_with(
-            555, "42", "👍",
+            555, 42, "👍",
         )
 
     async def test_outbound_reply_records_tg_sent_map(self):
@@ -317,7 +317,7 @@ class OutboundTextTests(unittest.IsolatedAsyncioTestCase):
         }}
         await bridge._handle_update(update)
         bridge._client.add_reaction.assert_awaited_once_with(
-            555, "42", "👍",
+            555, 42, "👍",
         )
 
 

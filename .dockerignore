@@ -5,4 +5,5 @@ __pycache__/
 config.json
 .env
 .git/
+data/
 _*.py

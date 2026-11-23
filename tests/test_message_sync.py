@@ -229,6 +229,7 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
             sync.on_link_created(link)
             with patch("message_sync.tg.set_message_reaction") as react:
                 await sync._poll_chat_watch("555")
+            client.get_reactions.assert_awaited_once_with(555, [77])
             react.assert_called_once_with(
                 "token", -100222, 99, "🔥", message_thread_id=None,
             )
@@ -335,7 +336,7 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
                 "user": {"id": 1},
                 "new_reaction": [{"type": "emoji", "emoji": "👍"}],
             })
-            client.add_reaction.assert_awaited_once_with(555, "42", "👍")
+            client.add_reaction.assert_awaited_once_with(555, 42, "👍")
 
     async def test_bot_tg_reaction_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:

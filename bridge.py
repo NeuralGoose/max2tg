@@ -15,7 +15,6 @@ import maxactions
 import mediamax
 import message_content
 import tg
-from pymax import WebClient
 from formatting import (
     FormattedText,
     build_delivery_formatted,
@@ -271,13 +270,6 @@ class MaxToTelegramBridge:
         self._delivered_cache.add(key)
         self._state.mark_delivered(chat_id, message_id)
 
-    @staticmethod
-    def _max_read_message_id(client, max_message_id) -> int | str:
-        """PyMax wire format: str for WebClient, int for TCP Client."""
-        if isinstance(client, WebClient):
-            return str(max_message_id)
-        return int(max_message_id)
-
     async def _mark_max_read_if_enabled(
         self, client, chat_id, max_message_id,
     ) -> None:
@@ -287,9 +279,8 @@ class MaxToTelegramBridge:
             return
         if self._is_excluded_chat(chat_id):
             return
-        msg_id = self._max_read_message_id(client, max_message_id)
         try:
-            await client.read_message(msg_id, int(chat_id))
+            await client.read_message(int(max_message_id), int(chat_id))
         except Exception as exc:
             _logger.warning(
                 "Could not mark MAX message %s read in chat %s: %s",

@@ -1,13 +1,12 @@
 # Run the max2tg test suite inside a container (nothing executes on the host).
-# Build context is the repo root so the local PyMax source is included in the image.
 #
 #   docker compose -f docker-compose.test.yml run --rm --build tests
 #
 services:
   tests:
     build:
-      context: ..
-      dockerfile: max2tg/Dockerfile.test
+      context: .
+      dockerfile: Dockerfile.test
     environment:
       PYTHONUNBUFFERED: "1"
     # Live smoke tests are opt-in (the default CMD excludes `-m integration`).

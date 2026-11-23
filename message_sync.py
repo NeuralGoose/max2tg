@@ -449,7 +449,7 @@ class MessageSync:
         if client is None:
             return
         max_chat_id = int(target["max_chat_id"])
-        max_message_id = str(target["max_message_id"])
+        max_message_id = int(target["max_message_id"])
         try:
             if emoji:
                 await client.add_reaction(max_chat_id, max_message_id, emoji)
@@ -659,7 +659,9 @@ class MessageSync:
         if not to_fetch:
             return
         try:
-            reactions = await client.get_reactions(int(max_chat_id), to_fetch)
+            reactions = await client.get_reactions(
+                int(max_chat_id), [int(mid) for mid in to_fetch],
+            )
         except Exception as exc:
             _logger.warning(
                 "Reaction watch poll failed for MAX chat %s: %s",
