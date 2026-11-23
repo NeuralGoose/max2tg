@@ -2387,7 +2387,7 @@ class MaxToTelegramBridge:
         client.on_message()(self._on_message)
         client.on_message_edit()(self._on_message_edit)
         client.on_message_delete()(self._on_message_delete)
-        client.on_raw()(self._sync.on_max_raw)
+        client.on_reaction_update()(self._sync.on_max_reaction)
         client.on_start()(self._on_start)
         client.on_disconnect()(self._on_max_disconnect)
         self._client = client

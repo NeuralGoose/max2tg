@@ -15,10 +15,9 @@ from message_sync import (
     MaxToTgEditDeps,
     MessageSync,
     SyncConfig,
-    parse_reaction_frame_payload,
     reaction_from_counters,
 )
-from pymax.protocol import Opcode
+from pymax import ReactionUpdateEvent
 
 
 def _message(*, id=1, chat_id=555, text="", stats=None):
@@ -137,7 +136,7 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
             edit.assert_called_once()
             self.assertIn(("555", "1"), sync._edit_guard_until)
 
-    async def test_max_to_tg_reaction_via_push_155(self):
+    async def test_max_to_tg_reaction_via_reaction_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             sync, links, holder = self._sync(tmp)
             client = Mock()
@@ -148,21 +147,40 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
                 telegram_message_id=10,
                 origin="max_to_tg",
             )
-            frame = SimpleNamespace(
-                opcode=int(Opcode.NOTIF_MSG_REACTIONS_CHANGED),
-                cmd=0,
-                payload={
-                    "chatId": 555,
-                    "messageId": "1",
-                    "counters": [{"count": 2, "reaction": "👍"}],
-                    "totalCount": 2,
-                },
-            )
+            event = ReactionUpdateEvent.model_validate({
+                "chatId": 555,
+                "messageId": "1",
+                "counters": [{"count": 2, "reaction": "👍"}],
+                "totalCount": 2,
+            })
             with patch("message_sync.tg.set_message_reaction") as react:
-                await sync.on_max_raw(frame, client)
+                await sync.on_max_reaction(event, client)
             react.assert_called_once_with(
                 "token", -100222, 10, "👍", message_thread_id=None,
             )
+
+    async def test_concurrent_reaction_signals_mirror_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp)
+            client = Mock()
+            holder[0] = client
+            links.link(
+                "555", "1",
+                telegram_chat_id=-100222,
+                telegram_message_id=10,
+                origin="max_to_tg",
+            )
+
+            def slow_react(*args, **kwargs):
+                time.sleep(0.05)
+
+            with patch("message_sync.tg.set_message_reaction",
+                       side_effect=slow_react) as react:
+                await asyncio.gather(
+                    sync.apply_max_to_tg(555, 1, "👍", client, source="a"),
+                    sync.apply_max_to_tg(555, 1, "👍", client, source="b"),
+                )
+            react.assert_called_once()
 
     async def test_max_to_tg_reaction_from_message_edit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -282,20 +300,16 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
                 telegram_message_id=99,
                 origin="tg_to_max",
             )
-            frame = SimpleNamespace(
-                opcode=int(Opcode.NOTIF_MSG_REACTIONS_CHANGED),
-                cmd=0,
-                payload={
-                    "chatId": 555,
-                    "messageId": "77",
-                    "reactionInfo": {
-                        "counters": [{"count": 1, "reaction": "❤️"}],
-                        "totalCount": 1,
-                    },
+            event = ReactionUpdateEvent.model_validate({
+                "chatId": 555,
+                "messageId": "77",
+                "reactionInfo": {
+                    "counters": [{"count": 1, "reaction": "❤️"}],
+                    "totalCount": 1,
                 },
-            )
+            })
             with patch("message_sync.tg.set_message_reaction") as react:
-                await sync.on_max_raw(frame, client)
+                await sync.on_max_reaction(event, client)
             react.assert_called_once_with(
                 "token", -100222, 99, "❤", message_thread_id=None,
             )
@@ -386,8 +400,32 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
                 "token", -100222, 10, None, message_thread_id=None,
             )
 
-    def test_parse_reaction_frame_nested(self):
-        chat_id, msg_id, counters, total, source = parse_reaction_frame_payload({
+    async def test_own_reaction_update_not_mirrored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp)
+            client = Mock()
+            holder[0] = client
+            links.link(
+                "555", "1",
+                telegram_chat_id=-100222,
+                telegram_message_id=10,
+                origin="max_to_tg",
+            )
+            event = ReactionUpdateEvent.model_validate({
+                "chatId": 555,
+                "messageId": "1",
+                "reactionInfo": {
+                    "counters": [{"count": 1, "reaction": "👍"}],
+                    "totalCount": 1,
+                    "yourReaction": "👍",
+                },
+            })
+            with patch("message_sync.tg.set_message_reaction") as react:
+                await sync.on_max_reaction(event, client)
+            react.assert_not_called()
+
+    def test_reaction_from_typed_counters(self):
+        event = ReactionUpdateEvent.model_validate({
             "chatId": 1,
             "messageId": "2",
             "reactionInfo": {
@@ -395,8 +433,8 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
                 "totalCount": 1,
             },
         })
-        self.assertEqual(source, "nested")
-        self.assertEqual(reaction_from_counters(counters, total), "❤️")
+        self.assertEqual(
+            reaction_from_counters(event.counters, event.total_count), "❤️")
 
 
 class _NullAsyncContext:

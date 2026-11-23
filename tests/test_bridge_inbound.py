@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import bridge as bridge_module
 from bridge import MaxToTelegramBridge
 from message_content import message_content_fingerprint
-from pymax.protocol import Opcode
+from pymax import ReactionUpdateEvent
 from state import BridgeState
 import tg
 from tests.test_link_fixtures import seed_max_to_tg_link
@@ -373,24 +373,20 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
             send.assert_called_once()
             self.assertNotIn("(изменено)", send.call_args.args[2])
 
-    async def test_bridge_raw_handler_delegates_to_sync(self):
+    async def test_bridge_reaction_handler_delegates_to_sync(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
             seed_max_to_tg_link(bridge, tg_message_id=10)
-            frame = SimpleNamespace(
-                opcode=int(Opcode.NOTIF_MSG_REACTIONS_CHANGED),
-                cmd=0,
-                payload={
-                    "chatId": 555,
-                    "messageId": "1",
-                    "counters": [{"count": 2, "reaction": "👍"}],
-                    "totalCount": 2,
-                },
-            )
+            event = ReactionUpdateEvent.model_validate({
+                "chatId": 555,
+                "messageId": "1",
+                "counters": [{"count": 2, "reaction": "👍"}],
+                "totalCount": 2,
+            })
             with patch("message_sync.tg.set_message_reaction") as react:
-                await bridge._sync.on_max_raw(frame, client)
+                await bridge._sync.on_max_reaction(event, client)
             react.assert_called_once_with(
                 "token", -100222, 10, "👍", message_thread_id=None,
             )
@@ -580,27 +576,23 @@ class TypedInboundTests(unittest.IsolatedAsyncioTestCase):
 
             client.read_message.assert_not_called()
 
-    async def test_opcode_156_not_mirrored(self):
+    async def test_own_reaction_not_mirrored(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self._bridge(tmp)
             client = self._client()
             bridge._client = client
             seed_max_to_tg_link(bridge, tg_message_id=10)
-            frame = SimpleNamespace(
-                opcode=int(Opcode.NOTIF_MSG_YOU_REACTED),
-                cmd=0,
-                payload={
-                    "chatId": 555,
-                    "messageId": "1",
-                    "reactionInfo": {
-                        "counters": [{"count": 1, "reaction": "👍"}],
-                        "totalCount": 1,
-                        "yourReaction": "👍",
-                    },
+            event = ReactionUpdateEvent.model_validate({
+                "chatId": 555,
+                "messageId": "1",
+                "reactionInfo": {
+                    "counters": [{"count": 1, "reaction": "👍"}],
+                    "totalCount": 1,
+                    "yourReaction": "👍",
                 },
-            )
+            })
             with patch("message_sync.tg.set_message_reaction") as react:
-                await bridge._sync.on_max_raw(frame, client)
+                await bridge._sync.on_max_reaction(event, client)
             react.assert_not_called()
 
     async def test_hydrate_message_links_from_state(self):

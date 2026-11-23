@@ -15,7 +15,6 @@ import tg
 from formatting import FormattedText, build_delivery_formatted, telegram_message_markdown
 from message_content import content_message, message_content_fingerprint
 from message_links import MessageLink, MessageLinkRegistry
-from pymax.protocol import Opcode
 from reaction_emoji import normalize_max_reaction_for_telegram
 
 _logger = logging.getLogger(__name__)
@@ -24,10 +23,6 @@ MIRROR_EDIT_MARKER = " · ред."
 REACTION_AFTER_EDIT_GUARD_SECONDS = 2.0
 CONTENT_FP_LIMIT = 10000
 HEAD_ROLES = frozenset({"text", "caption"})
-REACTION_EVENT_OPCODES = frozenset({
-    Opcode.NOTIF_MSG_REACTIONS_CHANGED,
-    Opcode.NOTIF_MSG_YOU_REACTED,
-})
 DEFAULT_POLL_DELAYS = (2, 15, 60, 300)
 STABLE_POLLS_TO_STOP = 2
 
@@ -106,25 +101,6 @@ def reaction_from_counters(counters, total_count: int) -> str | None:
     return best_emoji
 
 
-def parse_reaction_frame_payload(payload) -> tuple:
-    if not isinstance(payload, dict):
-        return None, None, None, 0, "invalid"
-    info = payload.get("reactionInfo")
-    if isinstance(info, dict):
-        chat_id = payload.get("chatId", info.get("chatId"))
-        message_id = payload.get("messageId", info.get("messageId"))
-        counters = info.get("counters") or payload.get("counters") or []
-        total_count = info.get("totalCount", payload.get("totalCount", 0))
-        source = "nested"
-    else:
-        chat_id = payload.get("chatId")
-        message_id = payload.get("messageId")
-        counters = payload.get("counters") or []
-        total_count = payload.get("totalCount", 0)
-        source = "flat"
-    return chat_id, message_id, counters, total_count, source
-
-
 def top_tg_reaction_emoji(reactions: list[dict]) -> str | None:
     best_emoji: str | None = None
     best_count = 0
@@ -195,6 +171,10 @@ class MessageSync:
         self._edit_guard_until: dict[tuple[str, str], float] = {}
         self._watch: dict[tuple[str, str], _WatchEntry] = {}
         self._chat_poll_tasks: dict[str, asyncio.Task] = {}
+        # Per-MAX-chat locks: overlapping polls / push events for one chat must
+        # not both pass the duplicate check and mirror the same reaction twice.
+        self._apply_locks: dict[str, asyncio.Lock] = {}
+        self._poll_locks: dict[str, asyncio.Lock] = {}
         self._on_delivered_discard: Callable[[str, str], None] | None = None
 
     def set_delivered_discard(self, cb: Callable[[str, str], None]) -> None:
@@ -254,36 +234,34 @@ class MessageSync:
         """Called when an already-delivered MAX message is seen again."""
         await self._apply_from_message_reaction_info(message, client, "redelivery")
 
-    async def on_max_raw(self, frame, client) -> None:
+    async def on_max_reaction(self, event, client) -> None:
+        """Typed PyMax ``ReactionUpdateEvent`` (reactions changed / you reacted)."""
         if client is not self._get_client():
             return
-        if frame.opcode not in REACTION_EVENT_OPCODES:
-            return
-        self._log_event_frame(frame)
-        payload = frame.payload or {}
-        chat_id, message_id, counters, total_count, source = (
-            parse_reaction_frame_payload(payload)
-        )
-        if frame.opcode == Opcode.NOTIF_MSG_YOU_REACTED:
-            _logger.debug(
-                "MAX raw reaction opcode=156 (you_reacted) cmd=%s chat=%s "
-                "msg=%s source=%s",
-                frame.cmd, chat_id, message_id, source,
-            )
-            return
-        emoji = reaction_from_counters(counters, total_count)
-        _logger.info(
-            "MAX raw reaction opcode=155 cmd=%s chat=%s msg=%s reaction=%r "
-            "source=%s",
-            frame.cmd, chat_id, message_id, emoji, source,
-        )
+        self._log_event(event)
+        chat_id = getattr(event, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
         if chat_id is None or message_id is None:
-            _logger.info(
-                "Reaction mirror skipped (missing_ids): opcode=155 payload=%s",
-                payload,
+            return
+        if getattr(event, "your_reaction", None) is not None:
+            # Our own reaction, typically the echo of a Telegram reaction just
+            # mirrored to MAX: never bounce it back to Telegram.
+            _logger.debug(
+                "MAX reaction update (own reaction) chat=%s msg=%s",
+                chat_id, message_id,
             )
             return
-        await self.apply_max_to_tg(chat_id, message_id, emoji, client, source="raw_155")
+        emoji = reaction_from_counters(
+            getattr(event, "counters", None) or [],
+            getattr(event, "total_count", 0),
+        )
+        _logger.info(
+            "MAX reaction update chat=%s msg=%s reaction=%r",
+            chat_id, message_id, emoji,
+        )
+        await self.apply_max_to_tg(
+            chat_id, message_id, emoji, client, source="reaction_update",
+        )
         await self._poll_chat_watch(str(chat_id))
 
     async def on_tg_edited_message(self, message: dict) -> None:
@@ -343,6 +321,15 @@ class MessageSync:
         if client is not self._get_client():
             self._debug_skip("stale_client")
             return
+        lock = self._apply_locks.setdefault(str(chat_id), asyncio.Lock())
+        async with lock:
+            await self._apply_max_to_tg_locked(
+                chat_id, message_id, emoji, source=source,
+            )
+
+    async def _apply_max_to_tg_locked(
+        self, chat_id, message_id, emoji: str | None, *, source: str,
+    ) -> None:
         key = (str(chat_id), str(message_id))
         entries = self._links.tg_targets_for_max(chat_id, message_id)
         if not entries:
@@ -638,6 +625,11 @@ class MessageSync:
         self._chat_poll_tasks[max_chat_id] = asyncio.create_task(_run())
 
     async def _poll_chat_watch(self, max_chat_id: str) -> None:
+        lock = self._poll_locks.setdefault(max_chat_id, asyncio.Lock())
+        async with lock:
+            await self._poll_chat_watch_locked(max_chat_id)
+
+    async def _poll_chat_watch_locked(self, max_chat_id: str) -> None:
         client = self._get_client()
         if client is None:
             return
@@ -709,19 +701,17 @@ class MessageSync:
             if not task.done():
                 task.cancel()
 
-    def _log_event_frame(self, frame) -> None:
+    def _log_event(self, event) -> None:
         path = self._config.events_log
         if path is None:
             return
         try:
             if path.exists() and path.stat().st_size > self._config.events_log_max_bytes:
                 return
+            dump = getattr(event, "model_dump", None)
+            record = dump(by_alias=True) if callable(dump) else vars(event)
             line = json.dumps(
-                {
-                    "opcode": frame.opcode,
-                    "cmd": frame.cmd,
-                    "payload": frame.payload,
-                },
+                {"event": type(event).__name__, "payload": record},
                 ensure_ascii=False,
                 default=str,
             )
