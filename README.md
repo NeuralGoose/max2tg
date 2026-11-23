@@ -398,9 +398,14 @@ docker compose up -d      # подтянет ghcr.io/neuralgoose/max2tg:latest
 
 ```bash
 docker compose -f docker-compose.test.yml run --rm --build tests   # pytest, -m "not integration"
+docker run --rm -v ${PWD}:/app -w /app python:3.12-slim \
+  sh -c "pip install --no-cache-dir ruff==0.17.6 && ruff check ."   # линтер, как в CI
 ```
 
-CI (GitHub Actions) на каждый push в `main` гоняет тесты (pytest) и публикует
+Лог моста — файл `bridge.log` (в Docker: `docker exec max2tg tail -f /app/bridge.log`).
+MAX-клиент — `maxapi-python` из PyPI, версия закреплена в `requirements.txt`.
+
+CI (GitHub Actions) на каждый push в `main` гоняет линтер (ruff), тесты (pytest) и публикует
 Docker-образ `ghcr.io/neuralgoose/max2tg:latest`. Для локальной сборки из исходников:
 `docker compose -f docker-compose.build.yml up -d --build`.
 

@@ -10,3 +10,4 @@ _*.py
 _*.txt
 docs/
 scripts/
+STATUS.md

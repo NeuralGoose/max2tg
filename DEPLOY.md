@@ -7,7 +7,7 @@ long-poll к Telegram). Поэтому нужен хост, который **н�
 
 ## ⚠️ Важно про IP и токен
 
-- Бэкенд MAX (`ws-api.oneme.ru`) может быть чувствителен к гео-IP. С зарубежного
+- Бэкенд MAX (`wss://api.oneme.ru/websocket`) может быть чувствителен к гео-IP. С зарубежного
   сервера соединение может не подняться — тогда понадобится прокси с российским
   IP. **С российским IP (домашнее устройство) проблем нет.**
 - Токен MAX привязан к сессии. Если он одновременно используется и в браузере, и
@@ -77,7 +77,7 @@ curl -O https://raw.githubusercontent.com/NeuralGoose/max2tg/main/docker-compose
 curl -o .env https://raw.githubusercontent.com/NeuralGoose/max2tg/main/.env.example
 nano .env                          # заполните MAX2TG_* (см. .env.example; свежий токен MAX!)
 docker compose up -d               # сам подтянет ghcr.io/neuralgoose/max2tg:latest
-docker compose logs -f
+docker exec max2tg tail -f /app/bridge.log
 ```
 Обновление на свежий образ позже: `docker compose pull && docker compose up -d`.
 Карта тем хранится на именованном томе `max2tg-data`, переживает обновления.
@@ -102,10 +102,10 @@ docker run --rm -v max2tg_max2tg-data:/from -v "${PWD}/data:/to" alpine sh -c "c
 **На preprod** (сборка из исходников):
 
 ```bash
-# скопируйте монорепо (max2tg/ + PyMax/), .env и каталог data/
+# скопируйте max2tg/ (PyMax ставится из PyPI), .env и каталог data/
 cd /opt/max2tg/max2tg
 docker compose -f docker-compose.build.yml up -d --build
-docker compose -f docker-compose.build.yml logs -f
+docker exec max2tg tail -f /app/bridge.log
 ```
 
 После успешного запуска на preprod именованный том на dev можно удалить:
@@ -147,7 +147,7 @@ cp .env.example .env
 nano .env                      # заполните MAX2TG_* (см. .env.example; свежий токен MAX!)
 chmod +x server_setup.sh
 ./server_setup.sh              # поставит Docker, соберёт и запустит
-sudo docker compose logs -f
+sudo docker exec max2tg tail -f /app/bridge.log
 ```
 Ждём строку `Bridge online (own id: ...)`.
 
@@ -166,9 +166,31 @@ sudo docker compose -f docker-compose.build.yml up -d --build
 
 ## Проверка после запуска
 
-1. В логах должно появиться `Bridge online (own id: ...)`.
+Мост пишет лог в файл `bridge.log` рядом с `main.py` (в Docker —
+`/app/bridge.log` внутри контейнера), а не в stdout: `docker compose logs`
+почти пуст. Файл живёт в контейнере и пропадает при его пересоздании.
+
+```bash
+docker exec max2tg tail -f /app/bridge.log
+```
+
+1. В логе должно появиться `Bridge online (own id: ...)`; перед ним —
+   `web handshake completed` и `client started profile=... chats=...`.
 2. Напишите себе в MAX с другого аккаунта — сообщение придёт в Telegram.
 3. Ответьте через Reply — проверьте, что ушло обратно в MAX.
+
+## Мост запустился, но молчит
+
+Контейнер работает, а сообщения не приходят, и в логе нет `web handshake completed`
+(или видны таймауты соединения) — скорее всего, MAX сменил адрес или протокол, а
+закреплённая версия PyMax устарела.
+
+1. Сравните версию `maxapi-python` в `requirements.txt` со свежей на
+   [PyPI](https://pypi.org/project/maxapi-python/) и посмотрите changelog/issues
+   [PyMax](https://github.com/MaxApiTeam/PyMax).
+2. Обновите версию, прогоните тесты (см. README), пересоберите образ.
+3. Перед пересборкой сделайте копию `data/` — новая версия PyMax может
+   мигрировать сессию `max.db`.
 
 ## Обновление токена
 

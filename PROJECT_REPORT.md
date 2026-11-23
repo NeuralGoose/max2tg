@@ -19,6 +19,8 @@
 | `mediamax.py` | Resolve MAX-медиа в URL и загрузка Telegram-медиа в MAX. |
 | `attaches.py` | Парсер вложений MAX. |
 | `message_content.py` | Сборка текста/автора/атрибуции из типизированного сообщения. |
+| `message_links.py` | `MessageLinkRegistry`: соответствие сообщений TG ↔ MAX (`links.db`). |
+| `message_sync.py` | Синхронизация правок и реакций между MAX и Telegram. |
 | `tg.py` | Минимальный клиент Telegram Bot API (с учётом 429/пейсинга). |
 | `state.py` | Персистентный mapping MAX-чат → Telegram-тема и дедуп. |
 | `config.py` | Чтение `config.json` + `.env`, нормализация настроек. |
@@ -26,9 +28,11 @@
 
 ## MAX-сторона (PyMax)
 
-Используется поддерживаемая библиотека [PyMax](https://github.com/) (типизированный
-клиент). Низкоуровневые опкоды и кастомный browser-клиент из эпохи `vkmax`
-больше не используются.
+Используется поддерживаемая библиотека [PyMax](https://github.com/MaxApiTeam/PyMax)
+(`maxapi-python`, типизированный клиент), версия закреплена в `requirements.txt`
+(сейчас 2.5.0, WebSocket `wss://api.oneme.ru/websocket`). Низкоуровневые опкоды и
+кастомный browser-клиент из эпохи `vkmax` больше не используются. PyMax ставится
+из PyPI без собственных правок.
 
 - Вход: `token` (вставленный web-токен), `sms` (телефон + код) или `qr`.
 - Сессия сохраняется в SQLite под `work_dir` (в Docker — на томе `/data`),
@@ -37,6 +41,9 @@
   (`on_message` / `on_message_edit` / `on_message_delete`).
 - Отправка текста/медиа и resolve файлов/видео идут через типизированный API
   PyMax (`send_message`, `get_file_by_id`, `get_video_by_id`).
+- Идентификаторы сообщений MAX передаются в PyMax как `int` (`read_message`,
+  `add_reaction`/`remove_reaction`, `get_reactions`, `edit_message`); в
+  `state.json`/`links.db` они хранятся строками.
 
 ## Telegram-сторона
 
@@ -91,7 +98,9 @@ Telegram Bot API через `requests` (`tg.py`):
 
 ## Ограничения и риски
 
-1. MAX API неофициальный; PyMax инкапсулирует изменения, но они возможны.
+1. MAX API неофициальный; PyMax инкапсулирует изменения, но при смене адреса или
+   протокола MAX закреплённая версия перестаёт подключаться. Признак — мост
+   запущен, но молчит; см. DEPLOY.md, «Мост запустился, но молчит».
 2. Reply-map хранится в памяти: после рестарта reply на старые Telegram-сообщения
    может не знать MAX message id (обычное сообщение в теме всё равно уйдёт в
    правильный чат).
@@ -109,4 +118,16 @@ python main.py
 
 ```bash
 docker compose -f docker-compose.test.yml run --rm --build tests
+```
+
+Юнит-тесты не ходят в сеть: `tests/conftest.py` блокирует реальные HTTP-запросы
+(кроме тестов с маркером `integration`), поэтому незамоканный вызов Telegram
+падает сразу, а не зависает на таймауте.
+
+Линтер — ruff, версия закреплена в CI (`ruff==0.17.6`), набор правил в
+`ruff.toml` (прежний набор по умолчанию: `E4`, `E7`, `E9`, `F`):
+
+```bash
+docker run --rm -v ${PWD}:/app -w /app python:3.12-slim \
+  sh -c "pip install --no-cache-dir ruff==0.17.6 && ruff check ."
 ```
