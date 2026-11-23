@@ -24,7 +24,8 @@ REACTION_AFTER_EDIT_GUARD_SECONDS = 2.0
 CONTENT_FP_LIMIT = 10000
 HEAD_ROLES = frozenset({"text", "caption"})
 DEFAULT_POLL_DELAYS = (2, 15, 60, 300)
-STABLE_POLLS_TO_STOP = 2
+DEFAULT_SWEEP_INTERVAL = 120
+REACTIONS_BATCH = 50
 
 
 class MaxEventKind(Enum):
@@ -40,6 +41,7 @@ class SyncConfig:
     sync_debug: bool = False
     poll_delays: tuple[int, ...] = DEFAULT_POLL_DELAYS
     watch_ttl: int = 86400
+    sweep_interval: int = DEFAULT_SWEEP_INTERVAL
     coalesce_seconds: float = 0.5
     events_log: Path | None = None
     events_log_max_bytes: int = 5 * 1024 * 1024
@@ -77,9 +79,14 @@ class _WatchEntry:
     max_chat_id: str
     max_message_id: str
     created_at: float
-    stable_count: int = 0
-    last_fetched: str | None = None
     pending_tasks: list[asyncio.Task] = field(default_factory=list)
+
+
+def _counter_fields(counter) -> tuple[str | None, int]:
+    if isinstance(counter, dict):
+        return counter.get("reaction"), int(counter.get("count") or 0)
+    return (getattr(counter, "reaction", None),
+            int(getattr(counter, "count", 0) or 0))
 
 
 def reaction_from_counters(counters, total_count: int) -> str | None:
@@ -89,16 +96,30 @@ def reaction_from_counters(counters, total_count: int) -> str | None:
     best_emoji: str | None = None
     best_count = -1
     for counter in counters or []:
-        if isinstance(counter, dict):
-            emoji = counter.get("reaction")
-            count = int(counter.get("count") or 0)
-        else:
-            emoji = getattr(counter, "reaction", None)
-            count = int(getattr(counter, "count", 0) or 0)
+        emoji, count = _counter_fields(counter)
         if emoji and count > best_count:
             best_count = count
             best_emoji = emoji
     return best_emoji
+
+
+def others_reaction(info) -> str | None:
+    """Top MAX reaction from other people. Our own reaction (``your_reaction``)
+    is usually the echo of a Telegram reaction mirrored to MAX and must not be
+    bounced back to Telegram."""
+    counters = getattr(info, "counters", None) or []
+    total = getattr(info, "total_count", 0)
+    own = getattr(info, "your_reaction", None)
+    if not own:
+        return reaction_from_counters(counters, total)
+    others = []
+    for counter in counters:
+        emoji, count = _counter_fields(counter)
+        if emoji == own:
+            count -= 1
+        if emoji and count > 0:
+            others.append({"reaction": emoji, "count": count})
+    return reaction_from_counters(others, sum(c["count"] for c in others))
 
 
 def top_tg_reaction_emoji(reactions: list[dict]) -> str | None:
@@ -175,6 +196,7 @@ class MessageSync:
         # not both pass the duplicate check and mirror the same reaction twice.
         self._apply_locks: dict[str, asyncio.Lock] = {}
         self._poll_locks: dict[str, asyncio.Lock] = {}
+        self._sweep_task: asyncio.Task | None = None
         self._on_delivered_discard: Callable[[str, str], None] | None = None
 
     def set_delivered_discard(self, cb: Callable[[str, str], None]) -> None:
@@ -182,11 +204,12 @@ class MessageSync:
 
     def on_link_created(self, link: MessageLink) -> None:
         key = (link.max_chat_id, link.max_message_id)
-        now = time.time()
+        if key in self._watch:
+            return
         entry = _WatchEntry(
             max_chat_id=link.max_chat_id,
             max_message_id=link.max_message_id,
-            created_at=now,
+            created_at=time.time(),
         )
         self._watch[key] = entry
         _logger.info(
@@ -243,18 +266,7 @@ class MessageSync:
         message_id = getattr(event, "message_id", None)
         if chat_id is None or message_id is None:
             return
-        if getattr(event, "your_reaction", None) is not None:
-            # Our own reaction, typically the echo of a Telegram reaction just
-            # mirrored to MAX: never bounce it back to Telegram.
-            _logger.debug(
-                "MAX reaction update (own reaction) chat=%s msg=%s",
-                chat_id, message_id,
-            )
-            return
-        emoji = reaction_from_counters(
-            getattr(event, "counters", None) or [],
-            getattr(event, "total_count", 0),
-        )
+        emoji = others_reaction(event)
         _logger.info(
             "MAX reaction update chat=%s msg=%s reaction=%r",
             chat_id, message_id, emoji,
@@ -366,7 +378,6 @@ class MessageSync:
                 chat_id, message_id, emoji,
             )
             self._last_applied[key] = emoji
-            self._stop_watch(key)
             return
         if tg_emoji is not None and tg_emoji != emoji:
             _logger.info(
@@ -389,17 +400,13 @@ class MessageSync:
                 emoji, head["message_id"], chat_id, message_id, source,
                 f", tg={tg_emoji!r}" if tg_emoji != emoji else "",
             )
-            if emoji is not None:
-                self._stop_watch(key)
         except Exception as exc:
             if emoji is not None and "REACTION_INVALID" in str(exc):
                 _logger.info(
-                    "Reaction %r not allowed on Telegram for msg %s "
-                    "(MAX %s/%s); stopping watch",
+                    "Reaction %r not allowed on Telegram for msg %s (MAX %s/%s)",
                     emoji, head["message_id"], chat_id, message_id,
                 )
                 self._last_applied[key] = emoji
-                self._stop_watch(key)
                 return
             _logger.warning(
                 "Failed to mirror MAX reaction %r to Telegram msg %s "
@@ -419,10 +426,7 @@ class MessageSync:
             if self._links.is_max_linked(chat_id, message_id):
                 self._schedule_chat_poll(str(chat_id))
             return
-        emoji = reaction_from_counters(
-            getattr(reaction_info, "counters", None) or [],
-            getattr(reaction_info, "total_count", 0),
-        )
+        emoji = others_reaction(reaction_info)
         _logger.info(
             "MAX reaction signal (%s) chat=%s msg=%s reaction=%r",
             source, chat_id, message_id, emoji,
@@ -633,72 +637,91 @@ class MessageSync:
         client = self._get_client()
         if client is None:
             return
-        now = time.time()
-        keys = [
-            k for k, w in self._watch.items()
-            if w.max_chat_id == max_chat_id
-            and now - w.created_at < self._config.watch_ttl
-        ]
-        if not keys:
-            return
-        to_fetch: list[str] = []
-        for key in keys:
-            entry = self._watch[key]
-            if (entry.last_fetched is not None
-                    and self._last_applied.get(key) == entry.last_fetched):
-                continue
-            to_fetch.append(key[1])
-        if not to_fetch:
-            return
-        try:
-            reactions = await client.get_reactions(
-                int(max_chat_id), [int(mid) for mid in to_fetch],
-            )
-        except Exception as exc:
-            _logger.warning(
-                "Reaction watch poll failed for MAX chat %s: %s",
-                max_chat_id, exc,
-            )
-            return
-        if not reactions:
-            reactions = {}
-        for key in keys:
-            mid = key[1]
-            if mid not in to_fetch:
-                continue
-            info = reactions.get(mid)
-            emoji = None
-            if info is not None:
-                emoji = reaction_from_counters(
-                    getattr(info, "counters", None) or [],
-                    getattr(info, "total_count", 0),
+        self._prune_watch()
+        mids: list[str] = []
+        for key in [k for k in self._watch if k[0] == max_chat_id]:
+            if self._links.is_max_linked(*key):
+                mids.append(key[1])
+            else:
+                self._stop_watch(key)
+        for start in range(0, len(mids), REACTIONS_BATCH):
+            batch = mids[start:start + REACTIONS_BATCH]
+            try:
+                reactions = await client.get_reactions(
+                    int(max_chat_id), [int(mid) for mid in batch],
                 )
-            entry = self._watch.get(key)
-            if entry is not None:
-                entry.last_fetched = emoji
-            if self._last_applied.get(key) == emoji:
-                if emoji is not None:
-                    if entry is not None:
-                        entry.stable_count += 1
-                        if entry.stable_count >= STABLE_POLLS_TO_STOP:
-                            self._stop_watch(key)
+            except Exception as exc:
+                _logger.warning(
+                    "Reaction watch poll failed for MAX chat %s: %s",
+                    max_chat_id, exc,
+                )
+                return
+            reactions = reactions or {}
+            for mid in batch:
+                info = reactions.get(mid)
+                emoji = others_reaction(info) if info is not None else None
+                if self._last_applied.get((max_chat_id, mid)) == emoji:
+                    continue
+                _logger.info(
+                    "MAX reaction watch poll chat=%s msg=%s reaction=%r",
+                    max_chat_id, mid, emoji,
+                )
+                await self.apply_max_to_tg(
+                    max_chat_id, mid, emoji, client, source="watch_poll",
+                )
+
+    def start_sweeper(self) -> None:
+        """Re-poll reactions on every message linked within ``watch_ttl``:
+        MAX does not reliably push reaction updates, and people react long
+        after the initial delayed polls. Safe to call on every reconnect."""
+        if self._config.sweep_interval <= 0:
+            return
+        if self._sweep_task is not None and not self._sweep_task.done():
+            return
+        self._seed_watch_from_links()
+        self._sweep_task = asyncio.create_task(self._sweep_loop())
+
+    def _seed_watch_from_links(self) -> None:
+        since = time.time() - self._config.watch_ttl
+        added = 0
+        for chat_id, mid, created_at in self._links.recent_max_messages(since):
+            if (chat_id, mid) in self._watch:
                 continue
-            _logger.info(
-                "MAX reaction watch poll chat=%s msg=%s reaction=%r",
-                max_chat_id, mid, emoji,
+            self._watch[(chat_id, mid)] = _WatchEntry(
+                max_chat_id=chat_id, max_message_id=mid,
+                created_at=float(created_at),
             )
-            await self.apply_max_to_tg(
-                max_chat_id, mid, emoji, client, source="watch_poll",
-            )
-            if entry is not None:
-                entry.stable_count = 0
+            added += 1
+        if added:
+            _logger.info("Reaction watch restored for %d recent MAX messages",
+                         added)
+
+    async def _sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._config.sweep_interval)
+            try:
+                await self.sweep()
+            except Exception:
+                _logger.exception("Reaction sweep failed")
+
+    async def sweep(self) -> None:
+        self._prune_watch()
+        for chat_id in sorted({w.max_chat_id for w in self._watch.values()}):
+            await self._poll_chat_watch(chat_id)
+
+    def _prune_watch(self) -> None:
+        cutoff = time.time() - self._config.watch_ttl
+        for key in [k for k, w in self._watch.items() if w.created_at < cutoff]:
+            self._stop_watch(key)
+            self._last_applied.pop(key, None)
 
     def _stop_watch(self, key: tuple[str, str]) -> None:
         entry = self._watch.pop(key, None)
         if entry is None:
             return
+        current = asyncio.current_task()
         for task in entry.pending_tasks:
-            if not task.done():
+            if not task.done() and task is not current:
                 task.cancel()
 
     def _log_event(self, event) -> None:

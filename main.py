@@ -39,6 +39,15 @@ class _RedactSecretsFilter(logging.Filter):
         return True
 
 
+class _DropReactionPollFilter(logging.Filter):
+    """The periodic reaction sweep calls PyMax get_reactions every couple of
+    minutes; its INFO line (with the full id list) would flood bridge.log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (record.name.startswith("pymax")
+                    and str(record.msg).startswith("getting reactions"))
+
+
 def _restrict_log_perms() -> None:
     """Lock bridge.log to the current user (it can hold message content)."""
     try:
@@ -66,6 +75,7 @@ def _configure() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    handler.addFilter(_DropReactionPollFilter())
     handler.addFilter(_RedactSecretsFilter())
     logging.basicConfig(
         level=logging.INFO,

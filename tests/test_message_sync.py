@@ -424,6 +424,121 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
                 await sync.on_max_reaction(event, client)
             react.assert_not_called()
 
+    async def test_watch_keeps_following_reaction_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, poll_delays=())
+            client = Mock()
+            holder[0] = client
+            link = links.link(
+                "555", "1",
+                telegram_chat_id=-100222,
+                telegram_message_id=10,
+                origin="max_to_tg",
+            )
+            sync.on_link_created(link)
+
+            def state(emoji):
+                counters = [SimpleNamespace(count=1, reaction=emoji)] if emoji else []
+                return {"1": SimpleNamespace(counters=counters,
+                                             total_count=len(counters))}
+
+            with patch("message_sync.tg.set_message_reaction") as react:
+                for emoji in ("🔥", "🔥", "👍", None):
+                    client.get_reactions = AsyncMock(return_value=state(emoji))
+                    await sync.sweep()
+            self.assertEqual(
+                [c.args[3] for c in react.call_args_list], ["🔥", "👍", None],
+            )
+            self.assertIn(("555", "1"), sync._watch)
+
+    async def test_poll_ignores_own_reaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, poll_delays=())
+            client = Mock()
+            holder[0] = client
+            for mid, tg_id in (("1", 10), ("2", 11)):
+                sync.on_link_created(links.link(
+                    "555", mid,
+                    telegram_chat_id=-100222,
+                    telegram_message_id=tg_id,
+                    origin="tg_to_max",
+                ))
+            client.get_reactions = AsyncMock(return_value={
+                "1": SimpleNamespace(
+                    counters=[SimpleNamespace(count=1, reaction="🦄")],
+                    total_count=1, your_reaction="🦄",
+                ),
+                "2": SimpleNamespace(
+                    counters=[SimpleNamespace(count=2, reaction="🔥"),
+                              SimpleNamespace(count=1, reaction="🦄")],
+                    total_count=3, your_reaction="🔥",
+                ),
+            })
+            with patch("message_sync.tg.set_message_reaction") as react:
+                await sync.sweep()
+            react.assert_called_once_with(
+                "token", -100222, 11, "🔥", message_thread_id=None,
+            )
+
+    async def test_start_sweeper_restores_recent_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, sweep_interval=3600)
+            for mid, tg_id in (("1", 10), ("2", 11)):
+                links.link("555", mid, telegram_chat_id=-100222,
+                           telegram_message_id=tg_id, origin="max_to_tg")
+            conn = links._connect()
+            conn.execute(
+                "UPDATE message_links SET created_at = ? WHERE max_message_id = '1'",
+                (int(time.time()) - 2 * 86400,),
+            )
+            conn.commit()
+            sync.start_sweeper()
+            try:
+                self.assertEqual(set(sync._watch), {("555", "2")})
+                task = sync._sweep_task
+                sync.start_sweeper()
+                self.assertIs(sync._sweep_task, task)
+            finally:
+                sync._sweep_task.cancel()
+
+    async def test_sweep_disabled_with_zero_interval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, sweep_interval=0)
+            sync.start_sweeper()
+            self.assertIsNone(sync._sweep_task)
+
+    async def test_sweep_drops_unlinked_and_expired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, poll_delays=())
+            client = Mock()
+            client.get_reactions = AsyncMock(return_value={})
+            holder[0] = client
+            for mid, tg_id in (("1", 10), ("2", 11), ("3", 12)):
+                sync.on_link_created(links.link(
+                    "555", mid, telegram_chat_id=-100222,
+                    telegram_message_id=tg_id, origin="max_to_tg",
+                ))
+            links.remove_max("555", "1")
+            sync._watch[("555", "2")].created_at = time.time() - 2 * 86400
+            await sync.sweep()
+            self.assertEqual(set(sync._watch), {("555", "3")})
+            client.get_reactions.assert_awaited_once_with(555, [3])
+
+    async def test_poll_batches_large_chats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync, links, holder = self._sync(tmp, poll_delays=())
+            client = Mock()
+            client.get_reactions = AsyncMock(return_value={})
+            holder[0] = client
+            for i in range(1, 121):
+                sync.on_link_created(links.link(
+                    "555", str(i), telegram_chat_id=-100222,
+                    telegram_message_id=1000 + i, origin="max_to_tg",
+                ))
+            await sync.sweep()
+            sizes = [len(c.args[1]) for c in client.get_reactions.await_args_list]
+            self.assertEqual(sizes, [50, 50, 20])
+
     def test_reaction_from_typed_counters(self):
         event = ReactionUpdateEvent.model_validate({
             "chatId": 1,

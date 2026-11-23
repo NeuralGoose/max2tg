@@ -166,6 +166,8 @@ class MaxToTelegramBridge:
             ),
             poll_delays=tuple(int(d) for d in delays),
             watch_ttl=int(self._config.get("sync_reaction_watch_ttl") or 86400),
+            sweep_interval=int(
+                self._config.get("sync_reaction_sweep_interval", 120)),
             coalesce_seconds=float(
                 self._config.get("sync_reaction_coalesce_seconds") or 0.5
             ),
@@ -2392,6 +2394,7 @@ class MaxToTelegramBridge:
         except Exception as exc:
             _logger.warning("Could not fetch Telegram bot id: %s", exc)
         _logger.info("Bridge online (own id: %s).", self._own_id)
+        self._sync.start_sweeper()
         await self._warn_if_max_client_outdated(client)
         await self._warn_forum_admin_if_needed()
         try:

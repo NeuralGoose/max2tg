@@ -317,6 +317,22 @@ class MessageLinkRegistry:
             return None
         return max(chrono, key=lambda x: x[0])[1]
 
+    def recent_max_messages(self, since: float) -> list[tuple[str, str, int]]:
+        """(max_chat_id, max_message_id, first created_at) linked since ``since``."""
+        rows = self._connect().execute(
+            """
+            SELECT max_chat_id, max_message_id, MIN(created_at) AS created_at
+            FROM message_links
+            WHERE created_at >= ?
+            GROUP BY max_chat_id, max_message_id
+            """,
+            (int(since),),
+        ).fetchall()
+        return [
+            (str(r["max_chat_id"]), str(r["max_message_id"]), int(r["created_at"]))
+            for r in rows
+        ]
+
     def remove_max(self, max_chat_id, max_message_id) -> None:
         mc = str(max_chat_id)
         mm = str(max_message_id)

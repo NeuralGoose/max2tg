@@ -206,6 +206,10 @@ def normalize_config(data: dict) -> dict:
         0,
         _coerce_int(result.get("sync_reaction_watch_ttl"), 86400),
     )
+    result["sync_reaction_sweep_interval"] = max(
+        0,
+        _coerce_int(result.get("sync_reaction_sweep_interval"), 120),
+    )
     result["sync_reaction_coalesce_seconds"] = max(
         0.0,
         _coerce_float(result.get("sync_reaction_coalesce_seconds"), 0.5),
@@ -281,6 +285,7 @@ ENV_MAP = {
     "sync_debug": "MAX2TG_SYNC_DEBUG",
     "sync_reaction_poll_delays": "MAX2TG_SYNC_REACTION_POLL_DELAYS",
     "sync_reaction_watch_ttl": "MAX2TG_SYNC_REACTION_WATCH_TTL",
+    "sync_reaction_sweep_interval": "MAX2TG_SYNC_REACTION_SWEEP_INTERVAL",
     "sync_reaction_coalesce_seconds": "MAX2TG_SYNC_REACTION_COALESCE_SECONDS",
     "telegram_exclude_chat_ids": "MAX2TG_TELEGRAM_EXCLUDE_CHAT_IDS",
     "links_db_path": "MAX2TG_LINKS_DB_PATH",
