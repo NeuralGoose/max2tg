@@ -501,6 +501,37 @@ class MessageSyncTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 sync._sweep_task.cancel()
 
+    async def test_restart_does_not_resend_mirrored_reactions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = {"1": SimpleNamespace(
+                counters=[SimpleNamespace(count=1, reaction="🔥")],
+                total_count=1,
+            )}
+            sync, links, holder = self._sync(tmp, poll_delays=(),
+                                             sweep_interval=3600)
+            holder[0] = Mock(get_reactions=AsyncMock(return_value=info))
+            sync.on_link_created(links.link(
+                "555", "1", telegram_chat_id=-100222,
+                telegram_message_id=10, origin="max_to_tg",
+            ))
+            with patch("message_sync.tg.set_message_reaction") as react:
+                await sync.sweep()
+            react.assert_called_once()
+            links.close()
+
+            restarted, links2, holder2 = self._sync(tmp, poll_delays=(),
+                                                    sweep_interval=3600)
+            links2.hydrate()
+            holder2[0] = Mock(get_reactions=AsyncMock(return_value=info))
+            restarted.start_sweeper()
+            try:
+                with patch("message_sync.tg.set_message_reaction") as react:
+                    await restarted.sweep()
+                react.assert_not_called()
+                self.assertIn(("555", "1"), restarted._watch)
+            finally:
+                restarted._sweep_task.cancel()
+
     async def test_sweep_disabled_with_zero_interval(self):
         with tempfile.TemporaryDirectory() as tmp:
             sync, links, holder = self._sync(tmp, sweep_interval=0)

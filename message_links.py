@@ -102,6 +102,13 @@ class MessageLinkRegistry:
                 ON message_links (telegram_chat_id, telegram_message_id);
             CREATE INDEX IF NOT EXISTS idx_links_max_created
                 ON message_links (max_chat_id, created_at);
+            CREATE TABLE IF NOT EXISTS reaction_state (
+                max_chat_id TEXT NOT NULL,
+                max_message_id TEXT NOT NULL,
+                emoji TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (max_chat_id, max_message_id)
+            );
             """
         )
         conn.commit()
@@ -332,6 +339,33 @@ class MessageLinkRegistry:
             (str(r["max_chat_id"]), str(r["max_message_id"]), int(r["created_at"]))
             for r in rows
         ]
+
+    def set_reaction_state(self, max_chat_id, max_message_id,
+                           emoji: str | None) -> None:
+        """Remember the MAX reaction last mirrored to Telegram."""
+        conn = self._connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO reaction_state
+                (max_chat_id, max_message_id, emoji, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(max_chat_id), str(max_message_id), emoji, int(time.time())),
+        )
+        conn.commit()
+
+    def reaction_states(self, since: float) -> dict[tuple[str, str], str | None]:
+        conn = self._connect()
+        conn.execute("DELETE FROM reaction_state WHERE updated_at < ?",
+                     (int(since),))
+        conn.commit()
+        rows = conn.execute(
+            "SELECT max_chat_id, max_message_id, emoji FROM reaction_state",
+        ).fetchall()
+        return {
+            (str(r["max_chat_id"]), str(r["max_message_id"])): r["emoji"]
+            for r in rows
+        }
 
     def remove_max(self, max_chat_id, max_message_id) -> None:
         mc = str(max_chat_id)

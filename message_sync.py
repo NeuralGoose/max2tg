@@ -377,7 +377,7 @@ class MessageSync:
                 "reaction=%r",
                 chat_id, message_id, emoji,
             )
-            self._last_applied[key] = emoji
+            self._remember_applied(key, emoji)
             return
         if tg_emoji is not None and tg_emoji != emoji:
             _logger.info(
@@ -393,7 +393,7 @@ class MessageSync:
                 tg_emoji,
                 message_thread_id=head.get("message_thread_id"),
             )
-            self._last_applied[key] = emoji
+            self._remember_applied(key, emoji)
             _logger.info(
                 "Mirrored MAX reaction %r to Telegram msg %s "
                 "(MAX %s/%s, source=%s%s)",
@@ -406,13 +406,21 @@ class MessageSync:
                     "Reaction %r not allowed on Telegram for msg %s (MAX %s/%s)",
                     emoji, head["message_id"], chat_id, message_id,
                 )
-                self._last_applied[key] = emoji
+                self._remember_applied(key, emoji)
                 return
             _logger.warning(
                 "Failed to mirror MAX reaction %r to Telegram msg %s "
                 "(MAX %s/%s): %s",
                 emoji, head["message_id"], chat_id, message_id, exc,
             )
+
+    def _remember_applied(self, key: tuple[str, str], emoji: str | None) -> None:
+        self._last_applied[key] = emoji
+        try:
+            self._links.set_reaction_state(*key, emoji)
+        except Exception as exc:
+            _logger.warning("Could not persist reaction state for MAX %s/%s: %s",
+                            *key, exc)
 
     async def _apply_from_message_reaction_info(
         self, message, client, source: str,
@@ -683,6 +691,8 @@ class MessageSync:
 
     def _seed_watch_from_links(self) -> None:
         since = time.time() - self._config.watch_ttl
+        for key, emoji in self._links.reaction_states(since).items():
+            self._last_applied.setdefault(key, emoji)
         added = 0
         for chat_id, mid, created_at in self._links.recent_max_messages(since):
             if (chat_id, mid) in self._watch:
